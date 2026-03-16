@@ -225,6 +225,10 @@ def fused_qk_rope_reshape_and_cache(
         + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
     )
 
+    is_fp4 = hasattr(torch, 'float4_e2m1fn_x2') and key_cache.dtype == torch.float4_e2m1fn_x2
+    if is_fp4:
+        apply_scale = False
+
     t, qh, d = q.shape
     tk, kh, dk = k.shape
     tv, vh, dv = v.shape
@@ -248,15 +252,26 @@ def fused_qk_rope_reshape_and_cache(
     assert (
         t_cache == t_cache_v
     ), "Number of tokens should be identical for key_cache, and value_cache"
-    if flash_layout:
-        assert (
-            d == dk == dv == dk_cache == dv_cache
-        ), "D dimension should be identical for q, k, and v"
+    if is_fp4:
+        if flash_layout:
+            assert (
+                d == dk == dv and dk_cache == d // 2 and dv_cache == d // 2
+            ), f"FP4: cache D should be half of input D, got {dk_cache=} {dv_cache=} vs {d=}"
+        else:
+            assert (
+                d == dk == dv and dkx_cache * x_cache == d // 2 and dv_cache == d // 2
+            ), f"FP4: cache D should be half of input D"
+            assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
     else:
-        assert (
-            d == dk == dv == dkx_cache * x_cache == dv_cache
-        ), "D dimension should be identical for q, k, and v"
-        assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
+        if flash_layout:
+            assert (
+                d == dk == dv == dk_cache == dv_cache
+            ), "D dimension should be identical for q, k, and v"
+        else:
+            assert (
+                d == dk == dv == dkx_cache * x_cache == dv_cache
+            ), "D dimension should be identical for q, k, and v"
+            assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
 
     assert d == triton.next_power_of_2(d), "D dimension should be power of 2"
     assert block_size == triton.next_power_of_2(
@@ -285,6 +300,21 @@ def fused_qk_rope_reshape_and_cache(
         zeros_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
     else:
         zeros_out = None
+
+    if is_fp4:
+        assert k_scale is not None and k_scale.dim() >= 2, \
+            "FP4 requires 2D per-token scale tensors (KH, max_slots)"
+        assert v_scale is not None and v_scale.dim() >= 2, \
+            "FP4 requires 2D per-token scale tensors (KH, max_slots)"
+        _orig_key_cache = key_cache
+        _orig_value_cache = value_cache
+        key_cache = key_cache.view(torch.uint8)
+        value_cache = value_cache.view(torch.uint8)
+        k_scale_stride_h = k_scale.stride(0)
+        v_scale_stride_h = v_scale.stride(0)
+    else:
+        k_scale_stride_h = 0
+        v_scale_stride_h = 0
 
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
@@ -339,8 +369,14 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
         HAVE_ZEROS=output_zeros,
+        k_scale_stride_h=k_scale_stride_h,
+        v_scale_stride_h=v_scale_stride_h,
         num_warps=1,
     )
+
+    if is_fp4:
+        key_cache = _orig_key_cache
+        value_cache = _orig_value_cache
 
     if zeros_out is not None:
         return q_out, k_out, key_cache, value_cache, zeros_out

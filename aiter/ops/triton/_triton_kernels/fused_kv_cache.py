@@ -378,6 +378,33 @@ def _unit_rope(
 
 
 @triton.jit
+def _f32_to_fp4_e2m1_packed(data, BLOCK_D: tl.constexpr):
+    """Quantize float32 vector to packed FP4 E2M1 with per-token scaling."""
+    data_f32 = data.to(tl.float32)
+    absmax = tl.max(tl.abs(data_f32))
+    scale = tl.where(absmax > 0.0, absmax / 6.0, 1.0)
+    scaled = data_f32 / scale
+
+    absval = tl.abs(scaled)
+    sign = tl.where(scaled < 0.0, 8, 0)
+    mag = tl.where(absval < 0.25, 0,
+          tl.where(absval < 0.75, 1,
+          tl.where(absval < 1.25, 2,
+          tl.where(absval < 1.75, 3,
+          tl.where(absval < 2.5, 4,
+          tl.where(absval < 3.5, 5,
+          tl.where(absval < 5.0, 6, 7)))))))
+    nibbles = sign | mag
+
+    d_offs = tl.arange(0, BLOCK_D)
+    nibbles_shifted = tl.where(d_offs % 2 == 0, nibbles, nibbles << 4)
+    nibbles_2d = tl.reshape(nibbles_shifted, (BLOCK_D // 2, 2))
+    packed = tl.sum(nibbles_2d, axis=1).to(tl.uint8)
+
+    return packed, scale
+
+
+@triton.jit
 def _fused_qk_rope_reshape_and_cache_kernel(
     q_ptr,
     k_ptr,
@@ -439,6 +466,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
     HAVE_ZEROS: tl.constexpr = False,
+    k_scale_stride_h=0,
+    v_scale_stride_h=0,
 ):
 
     tl.assume(q_stride_t >= 0)
@@ -567,52 +596,97 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 )
                 tl.store(k_out_ptrs, k_pe.to(k_out_ptr.dtype.element_ty))
 
-                k_scale_rcprl = 1 / k_scale
-                k_pe = k_pe * k_scale_rcprl
-
-                if FLASH_LAYOUT:
-                    k_out_ptrs = (
-                        key_cache_ptr
-                        + pid_t_slot * key_cache_stride_t
-                        + pid_b * key_cache_stride_b
-                        + pid_hk * key_cache_stride_h
-                        + d_pe_offs * key_cache_stride_d
+                if key_cache_ptr.dtype.element_ty == tl.uint8:
+                    k_packed, k_token_scale = _f32_to_fp4_e2m1_packed(k_pe, BLOCK_D_pe)
+                    tl.store(k_scale_ptr + pid_hk * k_scale_stride_h + pid_slot, k_token_scale)
+                    d_half_offs = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
+                    if FLASH_LAYOUT:
+                        k_fp4_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + pid_b * key_cache_stride_b
+                            + pid_hk * key_cache_stride_h
+                            + d_half_offs * key_cache_stride_d
+                        )
+                    else:
+                        k_packed_2d = tl.reshape(k_packed, (BLOCK_D_pe // 2 // X_SIZE, X_SIZE))
+                        dx_offs = tl.arange(0, BLOCK_D_pe // 2 // X_SIZE).to(tl.int64)
+                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
+                        k_fp4_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + pid_hk * key_cache_stride_h
+                            + dx_offs[:, None] * key_cache_stride_d
+                            + pid_b * key_cache_stride_b
+                            + x_offs[None, :] * key_cache_stride_x
+                        )
+                        k_packed = k_packed_2d
+                    tl.store(k_fp4_ptrs, k_packed)
+                    v_ptrs = (
+                        v_ptr
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs * v_stride_d
                     )
-                else:
-                    k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
-                    dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
-                    x_offs = tl.arange(0, X_SIZE).to(tl.int64)
-                    k_out_ptrs = (
-                        key_cache_ptr
-                        + pid_t_slot * key_cache_stride_t
-                        + pid_hk * key_cache_stride_h
-                        + dx_offs[:, None] * key_cache_stride_d
-                        + pid_b * key_cache_stride_b
-                        + x_offs[None, :] * key_cache_stride_x
+                    v_data = tl.load(v_ptrs)
+                    v_packed, v_token_scale = _f32_to_fp4_e2m1_packed(v_data, BLOCK_D_pe)
+                    tl.store(v_scale_ptr + pid_hk * v_scale_stride_h + pid_slot, v_token_scale)
+                    d_half_offs_v = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
+                    v_fp4_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + d_half_offs_v * value_cache_stride_d
+                        + pid_b * value_cache_stride_b
                     )
-
-                tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
-
-                v_ptrs = (
-                    v_ptr
-                    + pid_t * v_stride_t
-                    + pid_hk * v_stride_h
-                    + d_pe_offs * v_stride_d
-                )
-                if HAVE_V_SCALE:
-                    v_scale = tl.load(v_scale_ptr)
+                    tl.store(v_fp4_ptrs, v_packed)
                 else:
-                    v_scale = 1
-                v_scale_rcprl = 1 / v_scale
-                v = tl.load(v_ptrs) * v_scale_rcprl
-                v_out_ptrs = (
-                    value_cache_ptr
-                    + pid_t_slot * value_cache_stride_t
-                    + pid_hk * value_cache_stride_h
-                    + d_pe_offs.to(tl.int64) * value_cache_stride_d
-                    + pid_b * value_cache_stride_b
-                )
-                tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
+                    k_scale_rcprl = 1 / k_scale
+                    k_pe = k_pe * k_scale_rcprl
+
+                    if FLASH_LAYOUT:
+                        k_out_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + pid_b * key_cache_stride_b
+                            + pid_hk * key_cache_stride_h
+                            + d_pe_offs * key_cache_stride_d
+                        )
+                    else:
+                        k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
+                        dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
+                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
+                        k_out_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + pid_hk * key_cache_stride_h
+                            + dx_offs[:, None] * key_cache_stride_d
+                            + pid_b * key_cache_stride_b
+                            + x_offs[None, :] * key_cache_stride_x
+                        )
+
+                    tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
+
+                    v_ptrs = (
+                        v_ptr
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs * v_stride_d
+                    )
+                    if HAVE_V_SCALE:
+                        v_scale = tl.load(v_scale_ptr)
+                    else:
+                        v_scale = 1
+                    v_scale_rcprl = 1 / v_scale
+                    v = tl.load(v_ptrs) * v_scale_rcprl
+                    v_out_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + d_pe_offs.to(tl.int64) * value_cache_stride_d
+                        + pid_b * value_cache_stride_b
+                    )
+                    tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
     else:
         pid = pid - T * QH + T * KH
         if pid < T_slot * KH:
@@ -643,51 +717,96 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 )
                 tl.store(k_out_ptrs, k_pe.to(k_out_ptr.dtype.element_ty))
 
-                k_scale_rcprl = 1 / k_scale
-                k_pe = k_pe * k_scale_rcprl
-
-                if FLASH_LAYOUT:
-                    k_out_ptrs = (
-                        key_cache_ptr
-                        + pid_t_slot * key_cache_stride_t
-                        + d_pe_offs * key_cache_stride_d
-                        + pid_b * key_cache_stride_b
-                        + pid_hk * key_cache_stride_h
+                if key_cache_ptr.dtype.element_ty == tl.uint8:
+                    k_packed, k_token_scale = _f32_to_fp4_e2m1_packed(k_pe, BLOCK_D_pe)
+                    tl.store(k_scale_ptr + pid_hk * k_scale_stride_h + pid_slot, k_token_scale)
+                    d_half_offs = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
+                    if FLASH_LAYOUT:
+                        k_fp4_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + d_half_offs * key_cache_stride_d
+                            + pid_b * key_cache_stride_b
+                            + pid_hk * key_cache_stride_h
+                        )
+                    else:
+                        k_packed_2d = tl.reshape(k_packed, (BLOCK_D_pe // 2 // X_SIZE, X_SIZE))
+                        dx_offs = tl.arange(0, BLOCK_D_pe // 2 // X_SIZE).to(tl.int64)
+                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
+                        k_fp4_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + pid_hk * key_cache_stride_h
+                            + dx_offs[:, None] * key_cache_stride_d
+                            + pid_b * key_cache_stride_b
+                            + x_offs[None, :] * key_cache_stride_x
+                        )
+                        k_packed = k_packed_2d
+                    tl.store(k_fp4_ptrs, k_packed)
+                    v_ptrs = (
+                        v_ptr
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs * v_stride_d
                     )
-                else:
-                    k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
-                    dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
-                    x_offs = tl.arange(0, X_SIZE).to(tl.int64)
-                    k_out_ptrs = (
-                        key_cache_ptr
-                        + pid_t_slot * key_cache_stride_t
-                        + pid_hk * key_cache_stride_h
-                        + dx_offs[:, None] * key_cache_stride_d
-                        + pid_b * key_cache_stride_b
-                        + x_offs[None, :] * key_cache_stride_x
+                    v_data = tl.load(v_ptrs)
+                    v_packed, v_token_scale = _f32_to_fp4_e2m1_packed(v_data, BLOCK_D_pe)
+                    tl.store(v_scale_ptr + pid_hk * v_scale_stride_h + pid_slot, v_token_scale)
+                    d_half_offs_v = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
+                    v_fp4_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + d_half_offs_v * value_cache_stride_d
+                        + pid_b * value_cache_stride_b
                     )
-                tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
-
-                v_ptrs = (
-                    v_ptr
-                    + pid_t * v_stride_t
-                    + pid_hk * v_stride_h
-                    + d_pe_offs * v_stride_d
-                )
-                if HAVE_V_SCALE:
-                    v_scale = tl.load(v_scale_ptr)
+                    tl.store(v_fp4_ptrs, v_packed)
                 else:
-                    v_scale = 1
-                v_scale_rcprl = 1 / v_scale
-                v = tl.load(v_ptrs) * v_scale_rcprl
-                v_out_ptrs = (
-                    value_cache_ptr
-                    + pid_t_slot * value_cache_stride_t
-                    + pid_hk * value_cache_stride_h
-                    + d_pe_offs * value_cache_stride_d
-                    + pid_b * value_cache_stride_b
-                )
-                tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
+                    k_scale_rcprl = 1 / k_scale
+                    k_pe = k_pe * k_scale_rcprl
+
+                    if FLASH_LAYOUT:
+                        k_out_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + d_pe_offs * key_cache_stride_d
+                            + pid_b * key_cache_stride_b
+                            + pid_hk * key_cache_stride_h
+                        )
+                    else:
+                        k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
+                        dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
+                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
+                        k_out_ptrs = (
+                            key_cache_ptr
+                            + pid_t_slot * key_cache_stride_t
+                            + pid_hk * key_cache_stride_h
+                            + dx_offs[:, None] * key_cache_stride_d
+                            + pid_b * key_cache_stride_b
+                            + x_offs[None, :] * key_cache_stride_x
+                        )
+                    tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
+
+                    v_ptrs = (
+                        v_ptr
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs * v_stride_d
+                    )
+                    if HAVE_V_SCALE:
+                        v_scale = tl.load(v_scale_ptr)
+                    else:
+                        v_scale = 1
+                    v_scale_rcprl = 1 / v_scale
+                    v = tl.load(v_ptrs) * v_scale_rcprl
+                    v_out_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + d_pe_offs * value_cache_stride_d
+                        + pid_b * value_cache_stride_b
+                    )
+                    tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
 
 
 @triton.jit

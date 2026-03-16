@@ -1,0 +1,1374 @@
+diff --git a/aiter/ops/triton/_triton_kernels/fused_kv_cache.py b/aiter/ops/triton/_triton_kernels/fused_kv_cache.py
+index 0c1aa8bf..bd7b0996 100644
+--- a/aiter/ops/triton/_triton_kernels/fused_kv_cache.py
++++ b/aiter/ops/triton/_triton_kernels/fused_kv_cache.py
+@@ -377,6 +377,33 @@ def _unit_rope(
+     return x_pe
+ 
+ 
++@triton.jit
++def _f32_to_fp4_e2m1_packed(data, BLOCK_D: tl.constexpr):
++    """Quantize float32 vector to packed FP4 E2M1 with per-token scaling."""
++    data_f32 = data.to(tl.float32)
++    absmax = tl.max(tl.abs(data_f32))
++    scale = tl.where(absmax > 0.0, absmax / 6.0, 1.0)
++    scaled = data_f32 / scale
++
++    absval = tl.abs(scaled)
++    sign = tl.where(scaled < 0.0, 8, 0)
++    mag = tl.where(absval < 0.25, 0,
++          tl.where(absval < 0.75, 1,
++          tl.where(absval < 1.25, 2,
++          tl.where(absval < 1.75, 3,
++          tl.where(absval < 2.5, 4,
++          tl.where(absval < 3.5, 5,
++          tl.where(absval < 5.0, 6, 7)))))))
++    nibbles = sign | mag
++
++    d_offs = tl.arange(0, BLOCK_D)
++    nibbles_shifted = tl.where(d_offs % 2 == 0, nibbles, nibbles << 4)
++    nibbles_2d = tl.reshape(nibbles_shifted, (BLOCK_D // 2, 2))
++    packed = tl.sum(nibbles_2d, axis=1).to(tl.uint8)
++
++    return packed, scale
++
++
+ @triton.jit
+ def _fused_qk_rope_reshape_and_cache_kernel(
+     q_ptr,
+@@ -439,6 +466,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
+     HAVE_K_SCALE: tl.constexpr = False,
+     HAVE_V_SCALE: tl.constexpr = False,
+     HAVE_ZEROS: tl.constexpr = False,
++    k_scale_stride_h=0,
++    v_scale_stride_h=0,
+ ):
+ 
+     tl.assume(q_stride_t >= 0)
+@@ -567,52 +596,97 @@ def _fused_qk_rope_reshape_and_cache_kernel(
+                 )
+                 tl.store(k_out_ptrs, k_pe.to(k_out_ptr.dtype.element_ty))
+ 
+-                k_scale_rcprl = 1 / k_scale
+-                k_pe = k_pe * k_scale_rcprl
+-
+-                if FLASH_LAYOUT:
+-                    k_out_ptrs = (
+-                        key_cache_ptr
+-                        + pid_t_slot * key_cache_stride_t
+-                        + pid_b * key_cache_stride_b
+-                        + pid_hk * key_cache_stride_h
+-                        + d_pe_offs * key_cache_stride_d
++                if key_cache_ptr.dtype.element_ty == tl.uint8:
++                    k_packed, k_token_scale = _f32_to_fp4_e2m1_packed(k_pe, BLOCK_D_pe)
++                    tl.store(k_scale_ptr + pid_hk * k_scale_stride_h + pid_slot, k_token_scale)
++                    d_half_offs = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
++                    if FLASH_LAYOUT:
++                        k_fp4_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + pid_b * key_cache_stride_b
++                            + pid_hk * key_cache_stride_h
++                            + d_half_offs * key_cache_stride_d
++                        )
++                    else:
++                        k_packed_2d = tl.reshape(k_packed, (BLOCK_D_pe // 2 // X_SIZE, X_SIZE))
++                        dx_offs = tl.arange(0, BLOCK_D_pe // 2 // X_SIZE).to(tl.int64)
++                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
++                        k_fp4_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + pid_hk * key_cache_stride_h
++                            + dx_offs[:, None] * key_cache_stride_d
++                            + pid_b * key_cache_stride_b
++                            + x_offs[None, :] * key_cache_stride_x
++                        )
++                        k_packed = k_packed_2d
++                    tl.store(k_fp4_ptrs, k_packed)
++                    v_ptrs = (
++                        v_ptr
++                        + pid_t * v_stride_t
++                        + pid_hk * v_stride_h
++                        + d_pe_offs * v_stride_d
+                     )
+-                else:
+-                    k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
+-                    dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
+-                    x_offs = tl.arange(0, X_SIZE).to(tl.int64)
+-                    k_out_ptrs = (
+-                        key_cache_ptr
+-                        + pid_t_slot * key_cache_stride_t
+-                        + pid_hk * key_cache_stride_h
+-                        + dx_offs[:, None] * key_cache_stride_d
+-                        + pid_b * key_cache_stride_b
+-                        + x_offs[None, :] * key_cache_stride_x
++                    v_data = tl.load(v_ptrs)
++                    v_packed, v_token_scale = _f32_to_fp4_e2m1_packed(v_data, BLOCK_D_pe)
++                    tl.store(v_scale_ptr + pid_hk * v_scale_stride_h + pid_slot, v_token_scale)
++                    d_half_offs_v = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
++                    v_fp4_ptrs = (
++                        value_cache_ptr
++                        + pid_t_slot * value_cache_stride_t
++                        + pid_hk * value_cache_stride_h
++                        + d_half_offs_v * value_cache_stride_d
++                        + pid_b * value_cache_stride_b
+                     )
++                    tl.store(v_fp4_ptrs, v_packed)
++                else:
++                    k_scale_rcprl = 1 / k_scale
++                    k_pe = k_pe * k_scale_rcprl
+ 
+-                tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
++                    if FLASH_LAYOUT:
++                        k_out_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + pid_b * key_cache_stride_b
++                            + pid_hk * key_cache_stride_h
++                            + d_pe_offs * key_cache_stride_d
++                        )
++                    else:
++                        k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
++                        dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
++                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
++                        k_out_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + pid_hk * key_cache_stride_h
++                            + dx_offs[:, None] * key_cache_stride_d
++                            + pid_b * key_cache_stride_b
++                            + x_offs[None, :] * key_cache_stride_x
++                        )
+ 
+-                v_ptrs = (
+-                    v_ptr
+-                    + pid_t * v_stride_t
+-                    + pid_hk * v_stride_h
+-                    + d_pe_offs * v_stride_d
+-                )
+-                if HAVE_V_SCALE:
+-                    v_scale = tl.load(v_scale_ptr)
+-                else:
+-                    v_scale = 1
+-                v_scale_rcprl = 1 / v_scale
+-                v = tl.load(v_ptrs) * v_scale_rcprl
+-                v_out_ptrs = (
+-                    value_cache_ptr
+-                    + pid_t_slot * value_cache_stride_t
+-                    + pid_hk * value_cache_stride_h
+-                    + d_pe_offs.to(tl.int64) * value_cache_stride_d
+-                    + pid_b * value_cache_stride_b
+-                )
+-                tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
++                    tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
++
++                    v_ptrs = (
++                        v_ptr
++                        + pid_t * v_stride_t
++                        + pid_hk * v_stride_h
++                        + d_pe_offs * v_stride_d
++                    )
++                    if HAVE_V_SCALE:
++                        v_scale = tl.load(v_scale_ptr)
++                    else:
++                        v_scale = 1
++                    v_scale_rcprl = 1 / v_scale
++                    v = tl.load(v_ptrs) * v_scale_rcprl
++                    v_out_ptrs = (
++                        value_cache_ptr
++                        + pid_t_slot * value_cache_stride_t
++                        + pid_hk * value_cache_stride_h
++                        + d_pe_offs.to(tl.int64) * value_cache_stride_d
++                        + pid_b * value_cache_stride_b
++                    )
++                    tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
+     else:
+         pid = pid - T * QH + T * KH
+         if pid < T_slot * KH:
+@@ -643,51 +717,96 @@ def _fused_qk_rope_reshape_and_cache_kernel(
+                 )
+                 tl.store(k_out_ptrs, k_pe.to(k_out_ptr.dtype.element_ty))
+ 
+-                k_scale_rcprl = 1 / k_scale
+-                k_pe = k_pe * k_scale_rcprl
+-
+-                if FLASH_LAYOUT:
+-                    k_out_ptrs = (
+-                        key_cache_ptr
+-                        + pid_t_slot * key_cache_stride_t
+-                        + d_pe_offs * key_cache_stride_d
+-                        + pid_b * key_cache_stride_b
+-                        + pid_hk * key_cache_stride_h
++                if key_cache_ptr.dtype.element_ty == tl.uint8:
++                    k_packed, k_token_scale = _f32_to_fp4_e2m1_packed(k_pe, BLOCK_D_pe)
++                    tl.store(k_scale_ptr + pid_hk * k_scale_stride_h + pid_slot, k_token_scale)
++                    d_half_offs = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
++                    if FLASH_LAYOUT:
++                        k_fp4_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + d_half_offs * key_cache_stride_d
++                            + pid_b * key_cache_stride_b
++                            + pid_hk * key_cache_stride_h
++                        )
++                    else:
++                        k_packed_2d = tl.reshape(k_packed, (BLOCK_D_pe // 2 // X_SIZE, X_SIZE))
++                        dx_offs = tl.arange(0, BLOCK_D_pe // 2 // X_SIZE).to(tl.int64)
++                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
++                        k_fp4_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + pid_hk * key_cache_stride_h
++                            + dx_offs[:, None] * key_cache_stride_d
++                            + pid_b * key_cache_stride_b
++                            + x_offs[None, :] * key_cache_stride_x
++                        )
++                        k_packed = k_packed_2d
++                    tl.store(k_fp4_ptrs, k_packed)
++                    v_ptrs = (
++                        v_ptr
++                        + pid_t * v_stride_t
++                        + pid_hk * v_stride_h
++                        + d_pe_offs * v_stride_d
+                     )
+-                else:
+-                    k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
+-                    dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
+-                    x_offs = tl.arange(0, X_SIZE).to(tl.int64)
+-                    k_out_ptrs = (
+-                        key_cache_ptr
+-                        + pid_t_slot * key_cache_stride_t
+-                        + pid_hk * key_cache_stride_h
+-                        + dx_offs[:, None] * key_cache_stride_d
+-                        + pid_b * key_cache_stride_b
+-                        + x_offs[None, :] * key_cache_stride_x
++                    v_data = tl.load(v_ptrs)
++                    v_packed, v_token_scale = _f32_to_fp4_e2m1_packed(v_data, BLOCK_D_pe)
++                    tl.store(v_scale_ptr + pid_hk * v_scale_stride_h + pid_slot, v_token_scale)
++                    d_half_offs_v = tl.arange(0, BLOCK_D_pe // 2).to(tl.int64)
++                    v_fp4_ptrs = (
++                        value_cache_ptr
++                        + pid_t_slot * value_cache_stride_t
++                        + pid_hk * value_cache_stride_h
++                        + d_half_offs_v * value_cache_stride_d
++                        + pid_b * value_cache_stride_b
+                     )
+-                tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
+-
+-                v_ptrs = (
+-                    v_ptr
+-                    + pid_t * v_stride_t
+-                    + pid_hk * v_stride_h
+-                    + d_pe_offs * v_stride_d
+-                )
+-                if HAVE_V_SCALE:
+-                    v_scale = tl.load(v_scale_ptr)
++                    tl.store(v_fp4_ptrs, v_packed)
+                 else:
+-                    v_scale = 1
+-                v_scale_rcprl = 1 / v_scale
+-                v = tl.load(v_ptrs) * v_scale_rcprl
+-                v_out_ptrs = (
+-                    value_cache_ptr
+-                    + pid_t_slot * value_cache_stride_t
+-                    + pid_hk * value_cache_stride_h
+-                    + d_pe_offs * value_cache_stride_d
+-                    + pid_b * value_cache_stride_b
+-                )
+-                tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
++                    k_scale_rcprl = 1 / k_scale
++                    k_pe = k_pe * k_scale_rcprl
++
++                    if FLASH_LAYOUT:
++                        k_out_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + d_pe_offs * key_cache_stride_d
++                            + pid_b * key_cache_stride_b
++                            + pid_hk * key_cache_stride_h
++                        )
++                    else:
++                        k_pe = tl.reshape(k_pe, (BLOCK_D_pe // X_SIZE, X_SIZE))
++                        dx_offs = tl.arange(0, BLOCK_D_pe // X_SIZE).to(tl.int64)
++                        x_offs = tl.arange(0, X_SIZE).to(tl.int64)
++                        k_out_ptrs = (
++                            key_cache_ptr
++                            + pid_t_slot * key_cache_stride_t
++                            + pid_hk * key_cache_stride_h
++                            + dx_offs[:, None] * key_cache_stride_d
++                            + pid_b * key_cache_stride_b
++                            + x_offs[None, :] * key_cache_stride_x
++                        )
++                    tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
++
++                    v_ptrs = (
++                        v_ptr
++                        + pid_t * v_stride_t
++                        + pid_hk * v_stride_h
++                        + d_pe_offs * v_stride_d
++                    )
++                    if HAVE_V_SCALE:
++                        v_scale = tl.load(v_scale_ptr)
++                    else:
++                        v_scale = 1
++                    v_scale_rcprl = 1 / v_scale
++                    v = tl.load(v_ptrs) * v_scale_rcprl
++                    v_out_ptrs = (
++                        value_cache_ptr
++                        + pid_t_slot * value_cache_stride_t
++                        + pid_hk * value_cache_stride_h
++                        + d_pe_offs * value_cache_stride_d
++                        + pid_b * value_cache_stride_b
++                    )
++                    tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
+ 
+ 
+ @triton.jit
+diff --git a/aiter/ops/triton/fused_kv_cache.py b/aiter/ops/triton/fused_kv_cache.py
+index 51e707ce..7d615d0c 100644
+--- a/aiter/ops/triton/fused_kv_cache.py
++++ b/aiter/ops/triton/fused_kv_cache.py
+@@ -225,6 +225,10 @@ def fused_qk_rope_reshape_and_cache(
+         + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+     )
+ 
++    is_fp4 = hasattr(torch, 'float4_e2m1fn_x2') and key_cache.dtype == torch.float4_e2m1fn_x2
++    if is_fp4:
++        apply_scale = False
++
+     t, qh, d = q.shape
+     tk, kh, dk = k.shape
+     tv, vh, dv = v.shape
+@@ -248,15 +252,26 @@ def fused_qk_rope_reshape_and_cache(
+     assert (
+         t_cache == t_cache_v
+     ), "Number of tokens should be identical for key_cache, and value_cache"
+-    if flash_layout:
+-        assert (
+-            d == dk == dv == dk_cache == dv_cache
+-        ), "D dimension should be identical for q, k, and v"
++    if is_fp4:
++        if flash_layout:
++            assert (
++                d == dk == dv and dk_cache == d // 2 and dv_cache == d // 2
++            ), f"FP4: cache D should be half of input D, got {dk_cache=} {dv_cache=} vs {d=}"
++        else:
++            assert (
++                d == dk == dv and dkx_cache * x_cache == d // 2 and dv_cache == d // 2
++            ), f"FP4: cache D should be half of input D"
++            assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
+     else:
+-        assert (
+-            d == dk == dv == dkx_cache * x_cache == dv_cache
+-        ), "D dimension should be identical for q, k, and v"
+-        assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
++        if flash_layout:
++            assert (
++                d == dk == dv == dk_cache == dv_cache
++            ), "D dimension should be identical for q, k, and v"
++        else:
++            assert (
++                d == dk == dv == dkx_cache * x_cache == dv_cache
++            ), "D dimension should be identical for q, k, and v"
++            assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
+ 
+     assert d == triton.next_power_of_2(d), "D dimension should be power of 2"
+     assert block_size == triton.next_power_of_2(
+@@ -286,6 +301,21 @@ def fused_qk_rope_reshape_and_cache(
+     else:
+         zeros_out = None
+ 
++    if is_fp4:
++        assert k_scale is not None and k_scale.dim() >= 2, \
++            "FP4 requires 2D per-token scale tensors (KH, max_slots)"
++        assert v_scale is not None and v_scale.dim() >= 2, \
++            "FP4 requires 2D per-token scale tensors (KH, max_slots)"
++        _orig_key_cache = key_cache
++        _orig_value_cache = value_cache
++        key_cache = key_cache.view(torch.uint8)
++        value_cache = value_cache.view(torch.uint8)
++        k_scale_stride_h = k_scale.stride(0)
++        v_scale_stride_h = v_scale.stride(0)
++    else:
++        k_scale_stride_h = 0
++        v_scale_stride_h = 0
++
+     n_pid = t * qh + (t_slot - t) * kh
+     grid = (n_pid, 1, 1)
+     _fused_qk_rope_reshape_and_cache_kernel[grid](
+@@ -339,9 +369,15 @@ def fused_qk_rope_reshape_and_cache(
+         HAVE_K_SCALE=(k_scale is not None and apply_scale),
+         HAVE_V_SCALE=(v_scale is not None and apply_scale),
+         HAVE_ZEROS=output_zeros,
++        k_scale_stride_h=k_scale_stride_h,
++        v_scale_stride_h=v_scale_stride_h,
+         num_warps=1,
+     )
+ 
++    if is_fp4:
++        key_cache = _orig_key_cache
++        value_cache = _orig_value_cache
++
+     if zeros_out is not None:
+         return q_out, k_out, key_cache, value_cache, zeros_out
+     return q_out, k_out, key_cache, value_cache
+diff --git a/csrc/cpp_itfs/pa/pa_common.cuh b/csrc/cpp_itfs/pa/pa_common.cuh
+index 6027a0bf..23b71901 100644
+--- a/csrc/cpp_itfs/pa/pa_common.cuh
++++ b/csrc/cpp_itfs/pa/pa_common.cuh
+@@ -344,6 +344,72 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input)
+     return ret;
+ }
+ 
++// FP4 dequant: 8 bytes packed -> 8 BF16/FP16
++// byte_offset: 0 or 4 to select which half to process
++template <typename T>
++__device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input, int byte_offset = 0)
++{
++#if defined(__gfx950__)
++    union
++    {
++        uint2 u2;
++        uint8_t bytes[8];
++    } tmp;
++    tmp.u2 = input;
++
++    _B16x8 ret;
++
++    if constexpr(std::is_same<T, __hip_bfloat16>::value)
++    {
++        using bf16x2_raw_t = __bf16 __attribute__((ext_vector_type(2)));
++
++        for (int i = 0; i < 4; i++) {
++            uint8_t packed_byte = tmp.bytes[byte_offset + i];
++            bf16x2_raw_t bf_pair = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed_byte, 1.0f, 0);
++
++            union { bf16x2_raw_t vec; uint16_t u16[2]; } cvt;
++            cvt.vec = bf_pair;
++
++            ret.xy[i/2][2*(i%2) + 0] = cvt.u16[0];
++            ret.xy[i/2][2*(i%2) + 1] = cvt.u16[1];
++        }
++    }
++    else if constexpr(std::is_same<T, _Float16>::value)
++    {
++        using fp16x2_raw_t = _Float16 __attribute__((ext_vector_type(2)));
++
++        for (int i = 0; i < 4; i++) {
++            uint8_t packed_byte = tmp.bytes[byte_offset + i];
++            fp16x2_raw_t fp_pair = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed_byte, 1.0f, 0);
++
++            union { fp16x2_raw_t vec; uint16_t u16[2]; } cvt;
++            cvt.vec = fp_pair;
++            ret.xy[i/2][2*(i%2) + 0] = cvt.u16[0];
++            ret.xy[i/2][2*(i%2) + 1] = cvt.u16[1];
++        }
++    }
++    else
++    {
++        static_assert(std::is_same<T, __hip_bfloat16>::value || std::is_same<T, _Float16>::value,
++                      "FP4 conversion only supports BF16 or FP16");
++    }
++    return ret;
++#else
++    return _B16x8{};
++#endif
++}
++
++// Unified KV dequant dispatcher
++template <typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
++__device__ __forceinline__ _B16x8 convert_b8x8_kv(const _B8x8 input)
++{
++    if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
++        return convert_b8x8_fp4<T>(input);
++    } else {
++        return convert_b8x8_custom<T>(input);
++    }
++}
++
+ typedef union u64_cvt {
+   half f16x4[4];
+   int16_t b16x4[4];
+diff --git a/csrc/cpp_itfs/pa/pa_kernels.cuh b/csrc/cpp_itfs/pa/pa_kernels.cuh
+index 44959d0d..abdd8e1a 100644
+--- a/csrc/cpp_itfs/pa/pa_kernels.cuh
++++ b/csrc/cpp_itfs/pa/pa_kernels.cuh
+@@ -205,6 +205,11 @@ _paged_attention_kernel(const int* block_table_seq,
+     constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
+     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
+ 
++
++    // Per-token K scales array (for per-token scale support)
++    float k_token_scales[TLOOP];
++
++
+     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+     // fetch K values
+     for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+@@ -216,24 +221,62 @@ _paged_attention_kernel(const int* block_table_seq,
+         const int kphysical_block_offset = klocal_token_idx % BLOCK_SIZE;
+         const cache_t* k_ptr3            = k_ptr2 + kphysical_block_offset * kv_seq_stride;
+ 
++        float token_k_scale = 1.0f;
++        if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
++        {
++            const int64_t physical_token_idx = kblock_number * BLOCK_SIZE + kphysical_block_offset;
++
++            constexpr int64_t MAX_TOKENS_PER_HEAD = 32 * 1024 * 1024; // 32M tokens
++            const int64_t scale_idx = kv_head_idx * MAX_TOKENS_PER_HEAD + physical_token_idx;
++
++            token_k_scale = k_scale_ptr[scale_idx];
++        }
++        k_token_scales[token_depth] = token_k_scale;
++
+         for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
+         {
+             for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
+             {
+                 const int head_elem =
+                     row_head_elem + qkhe_depth * QKHE_PER_FETCH + head_loop * HEAD_SIZE_PER_LOOP;
+-                const int offset1             = head_elem / KX;
+-                const int offset2             = head_elem % KX;
+-                const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
+-                const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
+-                if constexpr(NT_KV_LOAD)
++                
++                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+                 {
+-                    Klocal[head_loop][token_depth][qkhe_depth] =
+-                        load_ntmprl_16Byte(k_fetch_ptr_16B);
++                    // FP4 packed: 2 FP4 values per byte
++                    const int byte_offset = head_elem / 2;
++                    const int offset1 = byte_offset / KX;
++                    const int offset2 = byte_offset % KX;
++                    const cache_t* k_fetch_ptr = k_ptr3 + offset1 * KX + offset2;
++                    
++                    // Load 8 bytes and duplicate to both halves for qkratio iterations
++                    union {
++                        uint64_t u64;
++                        _B16x8 b16x8;
++                    } loaded_data;
++                    loaded_data.u64 = *reinterpret_cast<const uint64_t*>(k_fetch_ptr);
++                    _B8x16 temp;
++                    temp.xy[0] = *reinterpret_cast<_B8x8*>(&loaded_data.u64);
++                    temp.xy[1] = temp.xy[0];
++                    loaded_data.b16x8 = *reinterpret_cast<_B16x8*>(&temp);
++                    
++                    Klocal[head_loop][token_depth][qkhe_depth] = loaded_data.b16x8;
+                 }
+                 else
+                 {
+-                    Klocal[head_loop][token_depth][qkhe_depth] = *k_fetch_ptr_16B;
++                    // FP8/Auto: load 16 bytes
++                    const int offset1             = head_elem / KX;
++                    const int offset2             = head_elem % KX;
++                    const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
++                    const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
++                    if constexpr(NT_KV_LOAD)
++                    {
++                        Klocal[head_loop][token_depth][qkhe_depth] =
++                            load_ntmprl_16Byte(k_fetch_ptr_16B);
++                    }
++                    else
++                    {
++                        Klocal[head_loop][token_depth][qkhe_depth] = *k_fetch_ptr_16B;
++                    }
+                 }
+             }
+         }
+@@ -302,16 +345,46 @@ _paged_attention_kernel(const int* block_table_seq,
+             for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
+             {
+                 const int vlds_col_idx = laneid % n_thread_per_block;
+-                const int vhead_elem =
+-                    vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+-                const cache_t* v_ptr2 = v_ptr + vhead_elem;
++                
++                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
++                {
++                    // FP4 packed: 2 FP4 values per byte
++                    const int vhead_elem_fp4 =
++                        vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
++                    const int vhead_elem = vhead_elem_fp4 / 2;
++                    const cache_t* v_ptr2 = v_ptr + vhead_elem;
++
++                    const int64_t vblock_number =
++                        static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
++                    const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
++
++                    // Load 8 bytes for FP4
++                    union {
++                        uint64_t u64;
++                        _B16x8 b16x8;
++                    } loaded_data;
++                    loaded_data.u64 = *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
++                    _B8x16 temp;
++                    temp.xy[0] = *reinterpret_cast<_B8x8*>(&loaded_data.u64);
++                    temp.xy[1] = temp.xy[0];
++                    loaded_data.b16x8 = *reinterpret_cast<_B16x8*>(&temp);
++                    
++                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] = loaded_data.b16x8;
++                }
++                else
++                {
++                    // FP8/Auto: load 16 bytes
++                    const int vhead_elem =
++                        vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
++                    const cache_t* v_ptr2 = v_ptr + vhead_elem;
+ 
+-                const int64_t vblock_number =
+-                    static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
+-                const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
++                    const int64_t vblock_number =
++                        static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
++                    const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
+ 
+-                Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
+-                    *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
++                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
++                        *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
++                }
+             }
+         }
+     }
+@@ -320,12 +393,13 @@ _paged_attention_kernel(const int* block_table_seq,
+     float scale2  = scale;
+     float q_scale = q_scale_ptr ? *q_scale_ptr : 1.0;
+ 
+-    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
++    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3 ||
++                 KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E5M2)
+     {
+-        // multiply by k_scale if fp8 kv cache
+         scale2 *= *k_scale_ptr;
+     }
+ 
++
+     const auto variant_params = [&] {
+         if constexpr(AttentionVariant::use_logits_soft_cap)
+         {
+@@ -372,6 +446,37 @@ _paged_attention_kernel(const int* block_table_seq,
+                                                       .xy[i],
+                                             d_out[gqa_ratio_loop][mtp][token_depth]);
+                                 }
++#endif
++                            }
++                        }
++                        else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
++                        {
++                            // FP4 KV cache: convert K from FP4 to BF16, use BF16 MFMA
++                            auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
++                            _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
++                            for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
++                            {
++                                _B8x8 Ktmp8x8_fp4 = Ktmp8x16.xy[qkratio];
++                                
++                                // Convert FP4: qkratio*4 is byte offset
++                                _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8_fp4, qkratio * 4);
++#if defined(__gfx950__)
++                                d_out[gqa_ratio_loop][mtp][token_depth] =
++                                    gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
++                                        Klocaltmp,
++                                        Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
++                                        d_out[gqa_ratio_loop][mtp][token_depth]);
++#else
++                                for(int i = 0; i < 2; i++)
++                                {
++                                    d_out[gqa_ratio_loop][mtp][token_depth] =
++                                        gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
++                                            Klocaltmp.xy[i],
++                                            Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth]
++                                                  [qkratio]
++                                                      .xy[i],
++                                            d_out[gqa_ratio_loop][mtp][token_depth]);
++                                }
+ #endif
+                             }
+                         }
+@@ -419,6 +524,25 @@ _paged_attention_kernel(const int* block_table_seq,
+             }
+         }
+     }
++
++
++    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
++    {
++        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
++        {
++            for(int mtp = 0; mtp < mtp_loop; mtp++)
++            {
++                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
++                {
++                    for(int i = 0; i < 4; i++)
++                    {
++                        d_out[gqa_ratio_loop][mtp][token_depth][i] *= k_token_scales[token_depth];
++                    }
++                }
++            }
++        }
++    }
++
+     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
+ 
+     // apply alibi
+@@ -593,8 +717,10 @@ _paged_attention_kernel(const int* block_table_seq,
+     // disable rtz conversion due to its impact on accuracy.
+     constexpr bool LOGITS_RTZ_CONVERSION = false;
+     // write logits to shared mem
+-    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
++    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto ||
++                 KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+     {
++        // FP4 uses BF16 MFMA (same as kAuto)
+         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+         {
+             for(int mtp = 0; mtp < mtp_loop; mtp++)
+@@ -772,6 +898,55 @@ _paged_attention_kernel(const int* block_table_seq,
+ #endif
+                         }
+                     }
++                    else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
++                    {
++                        // FP4: use kAuto structure (BF16 logits)
++                        constexpr int EFFECTIVE_VTLANELOOP = VTLANELOOP * ELEMS16_ELEMS8_RATIO;
++                        
++                        for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
++                        {
++                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
++                            _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
++                            for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
++                            {
++                                _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
++                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8);
++                                
++                                const int combined_vfetch = vfetch_depth * ELEMS16_ELEMS8_RATIO + j;
++
++#if defined(__gfx950__)
++                                _B16x8 tmp_in;
++                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
++                                {
++                                    const int offset =
++                                        rowid * EFFECTIVE_VTLANELOOP * ELEMS8_ELEMS4_RATIO +
++                                        combined_vfetch * ELEMS8_ELEMS4_RATIO + i;
++                                    const int offset1 = offset % ROWS_PER_WARP;
++                                    const int offset2 = offset / ROWS_PER_WARP;
++                                    tmp_in.xy[i] = shared_logits[gqa_ratio_loop][0][mtp]
++                                                                [vtoken_depth][offset2][lane16id]
++                                                                [offset1];
++                                }
++                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
++                                    Vlocaltmp, tmp_in, tmp_out);
++#else
++                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
++                                {
++                                    const int offset =
++                                        rowid * EFFECTIVE_VTLANELOOP * ELEMS8_ELEMS4_RATIO +
++                                        combined_vfetch * ELEMS8_ELEMS4_RATIO + i;
++                                    const int offset1 = offset % ROWS_PER_WARP;
++                                    const int offset2 = offset / ROWS_PER_WARP;
++                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
++                                        Vlocaltmp.xy[i],
++                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
++                                                     [offset2][lane16id][offset1],
++                                        tmp_out);
++                                }
++#endif
++                            }
++                        }
++                    }
+                     else
+                     {
+                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+@@ -1475,7 +1650,8 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
+ 
+     // qk mfma - calculate post qk mfma scale
+     float scale2 = scale;
+-    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
++    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3 ||
++                 KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E5M2)    
+     {
+         // multiply by k_scale if fp8 kv cache
+         scale2 *= *k_scale_ptr;
+@@ -1565,6 +1741,38 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
+                                 //         break;
+                                 //     }
+                             }
++                            else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
++                            { // kv cache dtype fp4: convert to BF16, use BF16 MFMA
++                                // Same structure as FP8 branch with internal qkratio loop
++                                auto Ktmp       = Kbuffer_reg[curr][head_loop][qkhe_depth];
++                                _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
++                                for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
++                                {
++                                    _B8x8 Ktmp8x8    = Ktmp8x16.xy[qkratio];
++                                    _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8);
++#if defined(__gfx950__)
++                                    d_out[gqa_ratio_loop][mtp][token_depth] =
++                                        gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
++                                            Klocaltmp,
++                                            Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth]
++                                                  [qkratio],
++                                            d_out[gqa_ratio_loop][mtp][token_depth]);
++                                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
++#else
++                                    for(int i = 0; i < 2; i++)
++                                    {
++                                        d_out[gqa_ratio_loop][mtp][token_depth] =
++                                            gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
++                                                Klocaltmp.xy[i],
++                                                Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth]
++                                                      [qkratio]
++                                                          .xy[i],
++                                                d_out[gqa_ratio_loop][mtp][token_depth]);
++                                    }
++                                    __builtin_amdgcn_sched_group_barrier(0x008, 2, 0); // MFMA
++#endif
++                                }
++                            }
+                             else
+                             { // kv cache dtype fp8
+                                 auto Ktmp       = Kbuffer_reg[curr][head_loop][qkhe_depth];
+@@ -2103,6 +2311,53 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
+ #endif
+                         }
+                     }
++                    else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
++                    {
++                        // FP4 V cache: convert to BF16, use BF16 MFMA
++                        // Use FP8's offset calculation since FP4 uses FP8's Q layout
++                        for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
++                        {
++                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
++                            _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
++                            for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
++                            {
++                                _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
++                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8);
++
++                                // Use FP8's offset calculation: rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO
++                                const int offset =
++                                    rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO +
++                                    j * ELEMS8_ELEMS4_RATIO;
++
++#if defined(__gfx950__)
++                                _B16x8 tmp_in;
++                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
++                                {
++                                    const int offset_i = offset + i;
++                                    const int offset1 = offset_i % ROWS_PER_WARP;
++                                    const int offset2 = offset_i / ROWS_PER_WARP;
++                                    tmp_in.xy[i] =
++                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
++                                                     [lane16id][offset1];
++                                }
++                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
++                                    Vlocaltmp, tmp_in, tmp_out);
++#else
++                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
++                                {
++                                    const int offset_i = offset + i;
++                                    const int offset1 = offset_i % ROWS_PER_WARP;
++                                    const int offset2 = offset_i / ROWS_PER_WARP;
++                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
++                                        Vlocaltmp.xy[i],
++                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
++                                                     [lane16id][offset1],
++                                        tmp_out);
++                                }
++#endif
++                            }
++                        }
++                    }
+                     else
+                     {
+                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+diff --git a/csrc/cpp_itfs/pa/pa_v1.cpp.jinja b/csrc/cpp_itfs/pa/pa_v1.cpp.jinja
+index 96d53c61..14d21b5e 100644
+--- a/csrc/cpp_itfs/pa/pa_v1.cpp.jinja
++++ b/csrc/cpp_itfs/pa/pa_v1.cpp.jinja
+@@ -80,6 +80,8 @@ void {{func_name}}(void* out_ptr,
+                                             {{kv_dtype}},
+                                             {% if fp8_kv_dtype == 'auto' %}
+                                             vllm::Fp8KVCacheDataType::kAuto,
++                                            {% elif fp8_kv_dtype == 'fp4' or fp8_kv_dtype == 'fp4_e2m1' %}
++                                            vllm::Fp8KVCacheDataType::kFp4E2M1,
+                                             {% else %}
+                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
+                                             {% endif %}                                
+@@ -127,4 +129,4 @@ void {{func_name}}(void* out_ptr,
+                                                                               max_num_partitions,                            
+                                                                               fp8_out_scale_ptr);
+                                     
+-}
+\ No newline at end of file
++}
+diff --git a/csrc/cpp_itfs/pa/pa_v1.cuh b/csrc/cpp_itfs/pa/pa_v1.cuh
+index d00308ee..04b8c6f8 100644
+--- a/csrc/cpp_itfs/pa/pa_v1.cuh
++++ b/csrc/cpp_itfs/pa/pa_v1.cuh
+@@ -84,7 +84,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
+         return;
+     }
+     const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
+-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);    
++    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);
+ }
+ 
+ // Grid: (num_heads, num_seqs).
+diff --git a/csrc/cpp_itfs/pa/pa_v1.py b/csrc/cpp_itfs/pa/pa_v1.py
+index cad347d8..a2ac77ec 100644
+--- a/csrc/cpp_itfs/pa/pa_v1.py
++++ b/csrc/cpp_itfs/pa/pa_v1.py
+@@ -98,6 +98,16 @@ def paged_attention_v1(
+             kv_dtype = "uint8_t"
+         else:
+             raise ValueError(f"Unsupported data type: {query.dtype}")
++    elif kv_cache_dtype == "fp4" or kv_cache_dtype == "fp4_e2m1":
++        # FP4: 2 values packed per byte (uint8_t)
++        if query.dtype == torch.bfloat16:
++            dtype = "__hip_bfloat16"
++            kv_dtype = "uint8_t"
++        elif query.dtype == torch.float16:
++            dtype = "_Float16"
++            kv_dtype = "uint8_t"
++        else:
++            raise ValueError(f"Unsupported data type: {query.dtype}")
+     else:
+         raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype}")
+ 
+@@ -210,6 +220,7 @@ def paged_attention_v1(
+         if q_scale is not None
+         else ctypes.POINTER(ctypes.c_float)()
+     )
++
+     func(
+         out_ptr,
+         workspace_buffer_ptr,
+diff --git a/csrc/include/dtype_fp8.cuh b/csrc/include/dtype_fp8.cuh
+index 62978418..1a265b25 100644
+--- a/csrc/include/dtype_fp8.cuh
++++ b/csrc/include/dtype_fp8.cuh
+@@ -31,6 +31,7 @@ enum class Fp8KVCacheDataType
+     kAuto    = 0,
+     kFp8E4M3 = 1,
+     kFp8E5M2 = 2,
++    kFp4E2M1 = 3,  // FP4 E2M1 (MXFP4) format, supported on gfx950+
+ };
+ 
+ enum class Fp8QuantMethod
+@@ -65,4 +66,9 @@ struct Vec<uint8_t, 8>
+     using Type = uint64_t;
+ };
+ 
++// FP4 packed type: 2 FP4 values packed in 1 byte (uint8_t)
++// For FP4, we use the same underlying storage as FP8 (uint8_t)
++// but interpret it differently: each byte contains 2 FP4 values
++// Lower 4 bits = first value, Upper 4 bits = second value
++
+ } // namespace vllm
+diff --git a/csrc/include/quant_utils.cuh b/csrc/include/quant_utils.cuh
+index 7132ecd2..3fabb6a5 100644
+--- a/csrc/include/quant_utils.cuh
++++ b/csrc/include/quant_utils.cuh
+@@ -706,6 +706,197 @@ __inline__ __device__ uint32_t scaled_vec_conversion<uint32_t, float4>(const flo
+ }
+ #endif // ENABLE_FP8
+ 
++// ============================================================================
++// FP4 (E2M1 / MXFP4) dequantization functions
++//
++// PACKED format: 2 FP4 values per byte (lower 4 bits = first value, upper 4 bits = second value)
++// This matches Python side packing: k_packed = k[..., ::2] | (k[..., 1::2] << 4)
++//
++// Hardware intrinsics available on gfx950+ (MI355x):
++//   __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(src, scale, index) - for packed format
++//   __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(src, scale, index)
++//   __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(src, scale, index)
++//
++// These intrinsics directly convert packed FP4x2 format to output types.
++// ============================================================================
++
++#if !defined(__gfx950__)
++#define FP4_NOT_SUPPORTED_MSG "FP4 KV cache requires gfx950+ architecture (MI355x). Not supported on this hardware."
++#endif
++
++namespace fp4 {
++
++// FP4 E2M1 lookup table for dequantization
++__device__ __constant__ float fp4_lut[16] = {
++    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
++    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
++};
++
++// Helper: pack_fp4x2 not needed anymore since we receive packed data
++
++// Base template for FP4 scaled_vec_conversion (required for template specializations)
++template <typename Tout, typename Tin>
++__inline__ __device__ Tout scaled_vec_conversion(const Tin& x, float scale)
++{
++    // Default implementation returns zero - actual implementations below
++    return Tout{};
++}
++
++#if defined(__gfx950__)
++// FP4 hardware conversion functions - only available on gfx950+
++// Input is already PACKED: 1 byte contains 2 FP4 values (lower 4 bits, upper 4 bits)
++
++// fp4x2 packed (1 byte = 2 FP4 values) -> __nv_bfloat162
++template <>
++__inline__ __device__ __nv_bfloat162
++scaled_vec_conversion<__nv_bfloat162, uint8_t>(const uint8_t& packed, float scale)
++{
++    // Hardware conversion: packed FP4x2 -> BF16x2 with scale
++    auto result = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed, scale, 0);
++    __nv_bfloat162 res;
++    res.x = __hip_bfloat16{result[0]};
++    res.y = __hip_bfloat16{result[1]};
++    return res;
++}
++
++// fp4x4 packed (2 bytes = 4 FP4 values) -> bf16_4_t
++template <>
++__inline__ __device__ bf16_4_t
++scaled_vec_conversion<bf16_4_t, uint16_t>(const uint16_t& packed, float scale)
++{
++    bf16_4_t res;
++    // Convert each packed byte (2 FP4 values) to bf16x2
++    uint8_t lo = packed & 0xFF;         // First byte with 2 FP4 values
++    uint8_t hi = (packed >> 8) & 0xFF;  // Second byte with 2 FP4 values
++    res.x = scaled_vec_conversion<__nv_bfloat162, uint8_t>(lo, scale);
++    res.y = scaled_vec_conversion<__nv_bfloat162, uint8_t>(hi, scale);
++    return res;
++}
++
++// fp4x8 packed (4 bytes = 8 FP4 values) -> bf16_8_t
++template <>
++__inline__ __device__ bf16_8_t
++scaled_vec_conversion<bf16_8_t, uint32_t>(const uint32_t& packed, float scale)
++{
++    bf16_4_t tmp1 = scaled_vec_conversion<bf16_4_t, uint16_t>((uint16_t)packed, scale);
++    bf16_4_t tmp2 = scaled_vec_conversion<bf16_4_t, uint16_t>((uint16_t)(packed >> 16U), scale);
++    bf16_8_t res;
++    res.x = tmp1.x;
++    res.y = tmp1.y;
++    res.z = tmp2.x;
++    res.w = tmp2.y;
++    return res;
++}
++
++#endif // defined(__gfx950__)
++
++#if defined(__gfx950__)
++// Float conversion functions for FP4 - only available on gfx950+
++
++// fp4x2 packed (1 byte = 2 FP4 values) -> float2
++template <>
++__inline__ __device__ float2
++scaled_vec_conversion<float2, uint8_t>(const uint8_t& packed, float scale)
++{
++    auto result = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(packed, scale, 0);
++    float2 res;
++    res.x = result[0];
++    res.y = result[1];
++    return res;
++}
++
++// fp4x4 packed (2 bytes = 4 FP4 values) -> Float4_
++template <>
++__inline__ __device__ Float4_
++scaled_vec_conversion<Float4_, uint16_t>(const uint16_t& packed, float scale)
++{
++    Float4_ res;
++    uint8_t lo = packed & 0xFF;
++    uint8_t hi = (packed >> 8) & 0xFF;
++    res.x = scaled_vec_conversion<float2, uint8_t>(lo, scale);
++    res.y = scaled_vec_conversion<float2, uint8_t>(hi, scale);
++    return res;
++}
++
++// fp4x8 packed (4 bytes = 8 FP4 values) -> Float8_
++template <>
++__inline__ __device__ Float8_
++scaled_vec_conversion<Float8_, uint32_t>(const uint32_t& packed, float scale)
++{
++    Float4_ tmp1 = scaled_vec_conversion<Float4_, uint16_t>((uint16_t)packed, scale);
++    Float4_ tmp2 = scaled_vec_conversion<Float4_, uint16_t>((uint16_t)(packed >> 16U), scale);
++    Float8_ res;
++    res.x = tmp1.x;
++    res.y = tmp1.y;
++    res.z = tmp2.x;
++    res.w = tmp2.y;
++    return res;
++}
++
++// fp4x2 packed (1 byte = 2 FP4 values) -> half2 (returned as uint32_t)
++template <>
++__inline__ __device__ uint32_t
++scaled_vec_conversion<uint32_t, uint16_t>(const uint16_t& a, float scale)
++{
++    // Pack 2 unpacked FP4 values into packed format
++    uint8_t lo = a & 0x0F;
++    uint8_t hi = (a >> 8) & 0x0F;
++    uint8_t packed = lo | (hi << 4);
++
++    auto result = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed, scale, 0);
++    union {
++        __half2_raw h2r;
++        uint32_t ui32;
++    } tmp;
++    tmp.h2r.x.data = result[0];
++    tmp.h2r.y.data = result[1];
++    return tmp.ui32;
++}
++
++// fp4x2 packed (1 byte = 2 FP4 values) -> half2 (returned as uint32_t)
++template <>
++__inline__ __device__ uint32_t
++scaled_vec_conversion<uint32_t, uint8_t>(const uint8_t& packed, float scale)
++{
++    auto result = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed, scale, 0);
++    union { _Float16 fp16[2]; uint32_t ui32; } tmp;
++    tmp.fp16[0] = result[0];
++    tmp.fp16[1] = result[1];
++    return tmp.ui32;
++}
++
++// fp4x4 packed (2 bytes = 4 FP4 values) -> uint2 (2 x half2)
++template <>
++__inline__ __device__ uint2
++scaled_vec_conversion<uint2, uint16_t>(const uint16_t& packed, float scale)
++{
++    uint2 res;
++    uint8_t lo = packed & 0xFF;
++    uint8_t hi = (packed >> 8) & 0xFF;
++    res.x = scaled_vec_conversion<uint32_t, uint8_t>(lo, scale);
++    res.y = scaled_vec_conversion<uint32_t, uint8_t>(hi, scale);
++    return res;
++}
++
++// fp4x8 packed (4 bytes = 8 FP4 values) -> uint4 (4 x half2)
++template <>
++__inline__ __device__ uint4
++scaled_vec_conversion<uint4, uint32_t>(const uint32_t& packed, float scale)
++{
++    uint4 res;
++    uint2 tmp1 = scaled_vec_conversion<uint2, uint16_t>((uint16_t)packed, scale);
++    uint2 tmp2 = scaled_vec_conversion<uint2, uint16_t>((uint16_t)(packed >> 16U), scale);
++    res.x = tmp1.x;
++    res.y = tmp1.y;
++    res.z = tmp2.x;
++    res.w = tmp2.y;
++    return res;
++}
++
++#endif // defined(__gfx950__) - Float/Half FP4 conversions
++
++} // namespace fp4
++
+ template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
+ __inline__ __device__ Tout convert(const Tin& x)
+ {
+@@ -727,6 +918,10 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
+     {
+         return scaled_vec_conversion<Tout, Tin>(x, scale);
+     }
++    else if constexpr(kv_dt == Fp8KVCacheDataType::kFp4E2M1)
++    {
++        return fp4::scaled_vec_conversion<Tout, Tin>(x, scale);
++    }
+ #endif
+     assert(false);
+     return {}; // Squash missing return statement warning
+@@ -777,6 +972,26 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
+                 TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
+             }                                                                            \
+         }                                                                                \
++        else if(KV_DTYPE == "fp4" || KV_DTYPE == "fp4_e2m1")                             \
++        {                                                                                \
++            /* FP4: 2 values packed per byte, use uint8_t as cache_t */                  \
++            if(SRC_DTYPE == at::ScalarType::Float)                                       \
++            {                                                                            \
++                FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);                  \
++            }                                                                            \
++            else if(SRC_DTYPE == at::ScalarType::Half)                                   \
++            {                                                                            \
++                FN(ck_tile::fp16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);        \
++            }                                                                            \
++            else if(SRC_DTYPE == at::ScalarType::BFloat16)                               \
++            {                                                                            \
++                FN(ck_tile::bf16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);        \
++            }                                                                            \
++            else                                                                         \
++            {                                                                            \
++                TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
++            }                                                                            \
++        }                                                                                \
+         else                                                                             \
+         {                                                                                \
+             TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);         \
+diff --git a/op_tests/triton_tests/test_fused_kv_cache.py b/op_tests/triton_tests/test_fused_kv_cache.py
+index 51e899cc..9511d96e 100644
+--- a/op_tests/triton_tests/test_fused_kv_cache.py
++++ b/op_tests/triton_tests/test_fused_kv_cache.py
+@@ -182,6 +182,31 @@ def test_fused_qk_rope_cat_and_cache_mla(
+     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
+ 
+ 
++def _ref_fp4_quantize_pack(data_f32):
++    """Reference FP4 E2M1 per-token quantization + packing. Input: [T, KH, D] float32."""
++    absmax = data_f32.abs().amax(dim=-1, keepdim=True)
++    scale = absmax / 6.0
++    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
++    scaled = data_f32 / scale
++
++    absval = scaled.abs()
++    sign = (scaled < 0).to(torch.uint8) * 8
++    mag = torch.zeros_like(absval, dtype=torch.uint8)
++    mag = torch.where(absval >= 0.25, torch.ones_like(mag), mag)
++    mag = torch.where(absval >= 0.75, torch.full_like(mag, 2), mag)
++    mag = torch.where(absval >= 1.25, torch.full_like(mag, 3), mag)
++    mag = torch.where(absval >= 1.75, torch.full_like(mag, 4), mag)
++    mag = torch.where(absval >= 2.5, torch.full_like(mag, 5), mag)
++    mag = torch.where(absval >= 3.5, torch.full_like(mag, 6), mag)
++    mag = torch.where(absval >= 5.0, torch.full_like(mag, 7), mag)
++    nibbles = sign | mag
++
++    even = nibbles[..., 0::2]
++    odd = nibbles[..., 1::2]
++    packed = even | (odd << 4)
++    return packed, scale.squeeze(-1)
++
++
+ @pytest.mark.parametrize("T", [1, 2, 4, 2048])
+ @pytest.mark.parametrize("QH_per_KH", [1, 16])
+ @pytest.mark.parametrize("KH", [1, 8])
+@@ -189,7 +214,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
+ @pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+ @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+ @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
++@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8, "fp4"])
+ @pytest.mark.parametrize("dtype", [torch.bfloat16])
+ @pytest.mark.parametrize("cache_flash", [False, True])
+ @pytest.mark.parametrize("block_size", [16])
+@@ -206,7 +231,7 @@ def test_fused_qk_rope_reshape_and_cache(
+     block_size: int,
+     x_size: int,
+     cache_flash: bool,
+-    cache_dtype: bool,
++    cache_dtype,
+     offs: bool,
+     dtype: torch.dtype,
+ ):
+@@ -228,6 +253,111 @@ def test_fused_qk_rope_reshape_and_cache(
+     )
+     v = torch.randn_like(k)
+ 
++    # FP4 path
++    if cache_dtype == "fp4":
++        if not hasattr(torch, 'float4_e2m1fn_x2'):
++            pytest.skip("torch.float4_e2m1fn_x2 not available")
++        max_slots = num_kv_cahce_tokens * block_size
++        if cache_flash:
++            fp4_key_cache = torch.zeros(
++                (num_kv_cahce_tokens, block_size, KH, D // 2),
++                dtype=torch.uint8, device="cuda"
++            ).view(dtype=torch.float4_e2m1fn_x2)
++            fp4_value_cache = torch.zeros(
++                (num_kv_cahce_tokens, block_size, KH, D // 2),
++                dtype=torch.uint8, device="cuda"
++            ).view(dtype=torch.float4_e2m1fn_x2)
++        else:
++            fp4_key_cache = torch.zeros(
++                (num_kv_cahce_tokens, KH, D // 2 // x_size, block_size, x_size),
++                dtype=torch.uint8, device="cuda"
++            ).view(dtype=torch.float4_e2m1fn_x2)
++            fp4_value_cache = torch.zeros(
++                (num_kv_cahce_tokens, KH, D // 2, block_size),
++                dtype=torch.uint8, device="cuda"
++            ).view(dtype=torch.float4_e2m1fn_x2)
++        fp4_k_scale = torch.zeros(KH, max_slots, dtype=torch.float32, device="cuda")
++        fp4_v_scale = torch.zeros(KH, max_slots, dtype=torch.float32, device="cuda")
++        fp4_slot_mapping = torch.randperm(T, device="cuda")
++        ref_freqs = (
++            freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(
++                -2
++            )
++            if pos
++            else freqs
++        )
++        torch_q = ref_rope_sbhd_fwd(
++            q.unsqueeze(0), ref_freqs,
++            rotate_style=rotate_style,
++            reuse_freqs_front_part=reuse_freqs_front_part,
++            nope_first=False,
++        ).squeeze(0)
++        torch_k = ref_rope_sbhd_fwd(
++            k.unsqueeze(0), ref_freqs,
++            rotate_style=rotate_style,
++            reuse_freqs_front_part=reuse_freqs_front_part,
++            nope_first=False,
++        ).squeeze(0)
++        torch_k_og_dtype = torch_k.clone()
++        slot_t = fp4_slot_mapping // block_size
++        slot_b = fp4_slot_mapping % block_size
++        ref_k_packed, ref_k_scale = _ref_fp4_quantize_pack(torch_k.to(torch.float32))
++        ref_v_packed, ref_v_scale = _ref_fp4_quantize_pack(v.to(torch.float32))
++        ref_key_cache = fp4_key_cache.clone().view(torch.uint8)
++        ref_value_cache = fp4_value_cache.clone().view(torch.uint8)
++        if cache_flash:
++            ref_key_cache[slot_t, slot_b] = ref_k_packed
++            ref_value_cache[slot_t, slot_b] = ref_v_packed
++        else:
++            ref_key_cache[slot_t, :, :, slot_b, :] = ref_k_packed.reshape(
++                T, KH, D // 2 // x_size, x_size
++            )
++            ref_value_cache[slot_t, :, :, slot_b] = ref_v_packed
++        ref_k_scale_full = torch.zeros(KH, max_slots, dtype=torch.float32, device="cuda")
++        ref_v_scale_full = torch.zeros(KH, max_slots, dtype=torch.float32, device="cuda")
++        for i in range(T):
++            ref_k_scale_full[:, fp4_slot_mapping[i]] = ref_k_scale[i]
++            ref_v_scale_full[:, fp4_slot_mapping[i]] = ref_v_scale[i]
++        triton_key_cache = fp4_key_cache.clone()
++        triton_value_cache = fp4_value_cache.clone()
++        triton_k_scale = fp4_k_scale.clone()
++        triton_v_scale = fp4_v_scale.clone()
++        result = fused_qk_rope_reshape_and_cache(
++            q, k, v,
++            triton_key_cache, triton_value_cache,
++            fp4_slot_mapping, positions, cos, sin,
++            triton_k_scale, triton_v_scale,
++            (rotate_style == RotateStyle.NEOX),
++            flash_layout=cache_flash,
++            apply_scale=False,
++            offs=offsets,
++            q_out=q,
++            k_out=k,
++        )
++        triton_q, triton_k_out = result[0], result[1]
++        triton_key_cache, triton_value_cache = result[2], result[3]
++        torch.testing.assert_close(torch_q, triton_q, atol=1e-1, rtol=1e-1)
++        torch.testing.assert_close(torch_k_og_dtype, triton_k_out, atol=1e-1, rtol=1e-1)
++        triton_cache_bytes = triton_key_cache.view(torch.uint8)
++        triton_vcache_bytes = triton_value_cache.view(torch.uint8)
++        if cache_flash:
++            ref_k_bytes = ref_key_cache[slot_t, slot_b]
++            tri_k_bytes = triton_cache_bytes[slot_t, slot_b]
++            ref_v_bytes = ref_value_cache[slot_t, slot_b]
++            tri_v_bytes = triton_vcache_bytes[slot_t, slot_b]
++        else:
++            ref_k_bytes = ref_key_cache[slot_t, :, :, slot_b, :]
++            tri_k_bytes = triton_cache_bytes[slot_t, :, :, slot_b, :]
++            ref_v_bytes = ref_value_cache[slot_t, :, :, slot_b]
++            tri_v_bytes = triton_vcache_bytes[slot_t, :, :, slot_b]
++        k_mismatch_rate = (ref_k_bytes != tri_k_bytes).float().mean().item()
++        v_mismatch_rate = (ref_v_bytes != tri_v_bytes).float().mean().item()
++        assert k_mismatch_rate < 0.01, f"FP4 key cache mismatch rate {k_mismatch_rate:.4f} >= 1%"
++        assert v_mismatch_rate < 0.01, f"FP4 value cache mismatch rate {v_mismatch_rate:.4f} >= 1%"
++        torch.testing.assert_close(ref_k_scale_full, triton_k_scale, atol=1e-4, rtol=1e-4)
++        torch.testing.assert_close(ref_v_scale_full, triton_v_scale, atol=1e-4, rtol=1e-4)
++        return
++
+     if cache_dtype == torch.uint8:
+         if arch_info.get_arch() in ["gfx950"]:
+             cache_dtype_actual = torch.float8_e4m3fn
