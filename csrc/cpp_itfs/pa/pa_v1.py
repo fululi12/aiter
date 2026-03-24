@@ -50,6 +50,7 @@ def compile(
         mtp=mtp,
         sliding_window_enabled=sliding_window_enabled,
         folder=folder,
+        abi_version=9,
     )
 
 
@@ -75,6 +76,10 @@ def paged_attention_v1(
     mtp: int = 1,
     q_scale=None,
     sliding_window: int = 0,
+    k_scale_stride_h: int = 0,
+    v_scale_stride_h: int = 0,
+    fp4_num_k_blocks: int = 1,
+    fp4_num_v_blocks: int = 1,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
@@ -247,6 +252,10 @@ def paged_attention_v1(
         kv_head_stride,
         kv_seq_stride,
         sliding_window,
+        ctypes.c_int64(k_scale_stride_h),
+        ctypes.c_int64(v_scale_stride_h),
+        ctypes.c_int(fp4_num_k_blocks),
+        ctypes.c_int(fp4_num_v_blocks),
         stream,
     )
     return out

@@ -399,6 +399,65 @@ __device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input, int byte_o
 #endif
 }
 
+// FP4 dequant with per-byte scales: each of the 4 bytes gets its own
+// dequantization scale baked into the HW conversion intrinsic.
+// Used for per-block V scaling where each byte is from a different token.
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_b8x8_fp4_scaled(
+    const _B8x8 input, int byte_offset, const float scales[4])
+{
+#if defined(__gfx950__)
+    union
+    {
+        uint2 u2;
+        uint8_t bytes[8];
+    } tmp;
+    tmp.u2 = input;
+
+    _B16x8 ret;
+
+    if constexpr(std::is_same<T, __hip_bfloat16>::value)
+    {
+        using bf16x2_raw_t = __bf16 __attribute__((ext_vector_type(2)));
+
+        for (int i = 0; i < 4; i++) {
+            uint8_t packed_byte = tmp.bytes[byte_offset + i];
+            bf16x2_raw_t bf_pair =
+                __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed_byte, scales[i], 0);
+
+            union { bf16x2_raw_t vec; uint16_t u16[2]; } cvt;
+            cvt.vec = bf_pair;
+
+            ret.xy[i/2][2*(i%2) + 0] = cvt.u16[0];
+            ret.xy[i/2][2*(i%2) + 1] = cvt.u16[1];
+        }
+    }
+    else if constexpr(std::is_same<T, _Float16>::value)
+    {
+        using fp16x2_raw_t = _Float16 __attribute__((ext_vector_type(2)));
+
+        for (int i = 0; i < 4; i++) {
+            uint8_t packed_byte = tmp.bytes[byte_offset + i];
+            fp16x2_raw_t fp_pair =
+                __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed_byte, scales[i], 0);
+
+            union { fp16x2_raw_t vec; uint16_t u16[2]; } cvt;
+            cvt.vec = fp_pair;
+            ret.xy[i/2][2*(i%2) + 0] = cvt.u16[0];
+            ret.xy[i/2][2*(i%2) + 1] = cvt.u16[1];
+        }
+    }
+    else
+    {
+        static_assert(std::is_same<T, __hip_bfloat16>::value || std::is_same<T, _Float16>::value,
+                      "FP4 scaled conversion only supports BF16 or FP16");
+    }
+    return ret;
+#else
+    return _B16x8{};
+#endif
+}
+
 // Unified KV dequant dispatcher
 template <typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
 __device__ __forceinline__ _B16x8 convert_b8x8_kv(const _B8x8 input)

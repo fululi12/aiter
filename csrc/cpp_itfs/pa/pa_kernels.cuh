@@ -2,6 +2,25 @@
 
 #include "pa_common.cuh"
 
+// FP8 E4M3 FNUZ to float conversion for NVFP4 block scales.
+// E4M3 FNUZ: 1 sign + 4 exponent (bias=8) + 3 mantissa bits.
+// For quantization scales we only store positive values (sign=0).
+__inline__ __device__ float fp8_e4m3_to_float_pa(uint8_t x) {
+  if (x == 0) return 0.0f;
+  int exp_bits = (x >> 3) & 0xF;
+  int mantissa = x & 0x7;
+  if (exp_bits == 0) {
+    return exp2f(-7.0f) * (static_cast<float>(mantissa) / 8.0f);
+  }
+  return exp2f(static_cast<float>(exp_bits - 8))
+         * (1.0f + static_cast<float>(mantissa) / 8.0f);
+}
+
+// Threshold to distinguish NVFP4 E4M3 signaling from MXFP4 E8M0.
+// fp4_num_k/v_blocks <= -NVFP4_SIGNAL_OFFSET  → NVFP4 E4M3 mode
+// -NVFP4_SIGNAL_OFFSET < fp4_num_k/v_blocks < 0  → MXFP4 E8M0 mode
+constexpr int NVFP4_SIGNAL_OFFSET = 1000;
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
@@ -38,7 +57,11 @@ _paged_attention_kernel(const int* block_table_seq,
                         const float* k_scale_ptr,
                         const float* v_scale_ptr,
                         const AttentionVariant* variant,
-                        const int sliding_window = 0)
+                        const int sliding_window = 0,
+                        const int64_t k_scale_stride_h = 0,
+                        const int64_t v_scale_stride_h = 0,
+                        const int fp4_num_k_blocks = 1,
+                        const int fp4_num_v_blocks = 1)
 {
     const int seq_idx                = blockIdx.x;
     const int partition_idx          = blockIdx.y;
@@ -206,8 +229,17 @@ _paged_attention_kernel(const int* block_table_seq,
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
 
 
-    // Per-token K scales array (for per-token scale support)
+    // Per-block K/V scales (FP4 per-block-32 support)
+    constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+    constexpr int FP4_MAX_K_BLOCKS = 16;  // head_size up to 512
+    constexpr int FP4_MAX_V_BLOCKS = 8;
+    float k_block_scales[TLOOP][FP4_MAX_K_BLOCKS];
+    float v_token_scales[TLOOP];
     float k_token_scales[TLOOP];
+
+    // Shared memory for per-block V scales: V MFMA needs cross-warp access
+    constexpr int V_SCALE_SMEM_TOKENS = TOKENS_PER_WARP * NWARPS;
+    __shared__ float v_blk_scale_smem[V_SCALE_SMEM_TOKENS * FP4_MAX_V_BLOCKS];
 
 
     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
@@ -222,16 +254,118 @@ _paged_attention_kernel(const int* block_table_seq,
         const cache_t* k_ptr3            = k_ptr2 + kphysical_block_offset * kv_seq_stride;
 
         float token_k_scale = 1.0f;
+        float token_v_scale = 1.0f;
         if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
         {
             const int64_t physical_token_idx = kblock_number * BLOCK_SIZE + kphysical_block_offset;
 
-            constexpr int64_t MAX_TOKENS_PER_HEAD = 32 * 1024 * 1024; // 32M tokens
-            const int64_t scale_idx = kv_head_idx * MAX_TOKENS_PER_HEAD + physical_token_idx;
+            const int64_t effective_stride = (k_scale_stride_h > 0)
+                ? k_scale_stride_h
+                : static_cast<int64_t>(32) * 1024 * 1024;
 
-            token_k_scale = k_scale_ptr[scale_idx];
+            if (fp4_num_k_blocks == 0) {
+                // Per-channel K mode: K channel scales absorbed into Q
+                // in Python before the PA call.  No per-token K scale.
+                token_k_scale = 1.0f;
+            } else if (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET) {
+                // NVFP4 E4M3 mode: scales stored as uint8, FP8 E4M3 format.
+                // Provides ~3 mantissa bits of precision per scale vs 0 for E8M0.
+                const int actual_k_blocks = -(fp4_num_k_blocks + NVFP4_SIGNAL_OFFSET);
+                const uint8_t* k_fp8_ptr =
+                    reinterpret_cast<const uint8_t*>(k_scale_ptr);
+                const int64_t k_blk_stride = effective_stride / actual_k_blocks;
+                for (int b = 0; b < actual_k_blocks; b++) {
+                    const int64_t scale_idx = kv_head_idx * effective_stride
+                                              + b * k_blk_stride
+                                              + physical_token_idx;
+                    uint8_t fp8_val = k_fp8_ptr[scale_idx];
+                    k_block_scales[token_depth][b] = fp8_e4m3_to_float_pa(fp8_val);
+                }
+                token_k_scale = 1.0f;
+            } else if (fp4_num_k_blocks < 0) {
+                // MXFP4 E8M0 mode: scales stored as uint8, power-of-2 values.
+                // Negative value signals MXFP4; actual block count = abs().
+                // Scale pointer is reinterpreted as uint8_t*.
+                const int actual_k_blocks = -fp4_num_k_blocks;
+                const uint8_t* k_e8m0_ptr =
+                    reinterpret_cast<const uint8_t*>(k_scale_ptr);
+                const int64_t k_blk_stride = effective_stride / actual_k_blocks;
+                for (int b = 0; b < actual_k_blocks; b++) {
+                    const int64_t scale_idx = kv_head_idx * effective_stride
+                                              + b * k_blk_stride
+                                              + physical_token_idx;
+                    uint8_t e8m0 = k_e8m0_ptr[scale_idx];
+                    k_block_scales[token_depth][b] =
+                        exp2f(static_cast<float>(e8m0) - 127.0f);
+                }
+                token_k_scale = 1.0f;
+            } else if (fp4_num_k_blocks > 1) {
+                // Per-block K scales: layout [num_heads * num_k_blocks, total_tokens]
+                // stride_h = num_k_blocks * total_tokens
+                const int64_t k_blk_stride = effective_stride / fp4_num_k_blocks;
+                for (int b = 0; b < fp4_num_k_blocks; b++) {
+                    const int64_t scale_idx = kv_head_idx * effective_stride
+                                              + b * k_blk_stride
+                                              + physical_token_idx;
+                    k_block_scales[token_depth][b] = k_scale_ptr[scale_idx];
+                }
+                token_k_scale = 1.0f;  // K pre-scaled, no post-MFMA multiply
+            } else {
+                const int64_t scale_idx = kv_head_idx * effective_stride + physical_token_idx;
+                token_k_scale = k_scale_ptr[scale_idx];
+            }
+
+            const int64_t v_eff_stride = (v_scale_stride_h > 0)
+                ? v_scale_stride_h
+                : effective_stride;
+
+            if (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET) {
+                // NVFP4 E4M3 mode for V scales
+                const int actual_v_blocks = -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET);
+                const uint8_t* v_fp8_ptr =
+                    reinterpret_cast<const uint8_t*>(v_scale_ptr);
+                const int64_t v_blk_stride = v_eff_stride / actual_v_blocks;
+                for (int b = 0; b < actual_v_blocks; b++) {
+                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
+                                                + b * v_blk_stride
+                                                + physical_token_idx;
+                    uint8_t fp8_val = v_fp8_ptr[v_scale_idx];
+                    float vbs = fp8_e4m3_to_float_pa(fp8_val);
+                    v_blk_scale_smem[klocal_token_idx * actual_v_blocks + b] = vbs;
+                }
+                token_v_scale = 1.0f;
+            } else if (fp4_num_v_blocks < 0) {
+                // MXFP4 E8M0 mode for V scales
+                const int actual_v_blocks = -fp4_num_v_blocks;
+                const uint8_t* v_e8m0_ptr =
+                    reinterpret_cast<const uint8_t*>(v_scale_ptr);
+                const int64_t v_blk_stride = v_eff_stride / actual_v_blocks;
+                for (int b = 0; b < actual_v_blocks; b++) {
+                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
+                                                + b * v_blk_stride
+                                                + physical_token_idx;
+                    uint8_t e8m0 = v_e8m0_ptr[v_scale_idx];
+                    float vbs = exp2f(static_cast<float>(e8m0) - 127.0f);
+                    v_blk_scale_smem[klocal_token_idx * actual_v_blocks + b] = vbs;
+                }
+                token_v_scale = 1.0f;
+            } else if (fp4_num_v_blocks > 1) {
+                const int64_t v_blk_stride = v_eff_stride / fp4_num_v_blocks;
+                for (int b = 0; b < fp4_num_v_blocks; b++) {
+                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
+                                                + b * v_blk_stride
+                                                + physical_token_idx;
+                    float vbs = v_scale_ptr[v_scale_idx];
+                    v_blk_scale_smem[klocal_token_idx * fp4_num_v_blocks + b] = vbs;
+                }
+                token_v_scale = 1.0f;  // V pre-scaled via intrinsic
+            } else {
+                const int64_t v_scale_idx = kv_head_idx * v_eff_stride + physical_token_idx;
+                token_v_scale = v_scale_ptr[v_scale_idx];
+            }
         }
         k_token_scales[token_depth] = token_k_scale;
+        v_token_scales[token_depth] = token_v_scale;
 
         for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
         {
@@ -460,6 +594,35 @@ _paged_attention_kernel(const int* block_table_seq,
                                 
                                 // Convert FP4: qkratio*4 is byte offset
                                 _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8_fp4, qkratio * 4);
+
+                                // Per-block K scale pre-multiply: works for fp32
+                                // (fp4_num_k_blocks > 1), MXFP4 E8M0 (<0), and
+                                // NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET) block scales.
+                                {
+                                    const int abs_k_blocks =
+                                        (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET)
+                                            ? -(fp4_num_k_blocks + NVFP4_SIGNAL_OFFSET)
+                                            : (fp4_num_k_blocks < 0)
+                                                ? -fp4_num_k_blocks
+                                                : fp4_num_k_blocks;
+                                    if (abs_k_blocks > 1) {
+                                    const int head_elem =
+                                        row_head_elem
+                                        + qkhe_depth * QKHE_PER_FETCH
+                                        + head_loop * HEAD_SIZE_PER_LOOP;
+                                    const int k_blk = head_elem / FP4_QUANT_BLOCK_SIZE;
+                                    const float k_blk_scale =
+                                        k_block_scales[token_depth][k_blk];
+                                    scalar_t* kvals =
+                                        reinterpret_cast<scalar_t*>(&Klocaltmp);
+                                    for (int e = 0; e < 8; e++) {
+                                        float f = to_float<scalar_t>(kvals[e])
+                                                  * k_blk_scale;
+                                        kvals[e] = from_float<scalar_t>(f);
+                                    }
+                                    }
+                                }
+
 #if defined(__gfx950__)
                                 d_out[gqa_ratio_loop][mtp][token_depth] =
                                     gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
@@ -728,6 +891,10 @@ _paged_attention_kernel(const int* block_table_seq,
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
                     d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+                    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+                    {
+                        d_out[gqa_ratio_loop][mtp][token_depth] *= v_token_scales[token_depth];
+                    }
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
                         // use rtz conversion for better performance, with negligible impact on
@@ -900,7 +1067,6 @@ _paged_attention_kernel(const int* block_table_seq,
                     }
                     else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                     {
-                        // FP4: use kAuto structure (BF16 logits)
                         constexpr int EFFECTIVE_VTLANELOOP = VTLANELOOP * ELEMS16_ELEMS8_RATIO;
                         
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
@@ -909,8 +1075,49 @@ _paged_attention_kernel(const int* block_table_seq,
                             _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
-                                _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
-                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8);
+                                _B8x8 Vtmp8x8 = Vtmp8x16.xy[j];
+                                _B16x8 Vlocaltmp;
+
+                                Vlocaltmp = convert_b8x8_fp4<scalar_t>(
+                                    Vtmp8x8, j * 4);
+
+                                {
+                                    // V per-block dequant: works for fp32
+                                    // (fp4_num_v_blocks > 1), MXFP4 E8M0 (<0),
+                                    // and NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET)
+                                    const int abs_v_blocks =
+                                        (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET)
+                                            ? -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET)
+                                            : (fp4_num_v_blocks < 0)
+                                                ? -fp4_num_v_blocks
+                                                : fp4_num_v_blocks;
+                                    if (abs_v_blocks > 1) {
+                                    const int v_blk =
+                                        (vhe_depth * NWARPS * 16 + warpid * 16) / FP4_QUANT_BLOCK_SIZE;
+                                    const int vlocal_tok =
+                                        rowid * VTOKENS_PER_LANE
+                                        + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                                    scalar_t* vvals =
+                                        reinterpret_cast<scalar_t*>(&Vlocaltmp);
+                                    for (int bi = 0; bi < 4; bi++) {
+                                        const int byte_in_16 =
+                                            (j == 0) ? bi : (12 + bi);
+                                        const int tok_in_part =
+                                            vtoken_depth * TOKENS_PER_WARP
+                                            + vlocal_tok + byte_in_16;
+                                        const float s =
+                                            (tok_in_part < V_SCALE_SMEM_TOKENS)
+                                            ? v_blk_scale_smem[tok_in_part
+                                                * abs_v_blocks + v_blk]
+                                            : 0.0f;
+                                        const int base = bi * 2;
+                                        vvals[base] = from_float<scalar_t>(
+                                            to_float<scalar_t>(vvals[base]) * s);
+                                        vvals[base + 1] = from_float<scalar_t>(
+                                            to_float<scalar_t>(vvals[base + 1]) * s);
+                                    }
+                                    }
+                                }
                                 
                                 const int combined_vfetch = vfetch_depth * ELEMS16_ELEMS8_RATIO + j;
 
@@ -979,8 +1186,10 @@ _paged_attention_kernel(const int* block_table_seq,
                     }
                     __syncthreads();
                 }
-                // apply post Softmax V mfma v_scale
-                if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+                // apply post Softmax V mfma v_scale (scalar, for FP8 only;
+                // FP4 per-token V scale is pre-applied to softmax weights)
+                if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto &&
+                             KV_DTYPE != vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
                     tmp_out *= *v_scale_ptr;
                 }
@@ -1331,7 +1540,9 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     const float* k_scale_ptr,
     const float* v_scale_ptr,
     const AttentionVariant* variant,
-    const int sliding_window = 0)
+    const int sliding_window = 0,
+    const int64_t k_scale_stride_h = 0,
+    const int64_t v_scale_stride_h = 0)
 {
     const int seq_idx                = blockIdx.x;
     const int partition_idx          = blockIdx.y;
@@ -1749,7 +1960,8 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                 for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                                 {
                                     _B8x8 Ktmp8x8    = Ktmp8x16.xy[qkratio];
-                                    _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8);
+                                    // byte_offset=qkratio*4: processes bytes[0..3] or [4..7]
+                                    _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8, qkratio * 4);
 #if defined(__gfx950__)
                                     d_out[gqa_ratio_loop][mtp][token_depth] =
                                         gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
@@ -2322,7 +2534,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
                                 _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
-                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8);
+                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8, j * 4);
 
                                 // Use FP8's offset calculation: rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO
                                 const int offset =
@@ -2407,8 +2619,10 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                     }
                     __syncthreads();
                 }
-                // apply post Softmax V mfma v_scale
-                if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+                // apply post Softmax V mfma v_scale (scalar, for FP8 only;
+                // FP4 per-token V scale is pre-applied to softmax weights)
+                if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto &&
+                             KV_DTYPE != vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
                     tmp_out *= *v_scale_ptr;
                 }

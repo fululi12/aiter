@@ -63,7 +63,11 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     const float* k_scale_ptr,
     const float* v_scale_ptr,
     const AttentionVariant* variant,
-    const int sliding_window)
+    const int sliding_window,
+    const int64_t k_scale_stride_h = 0,
+    const int64_t v_scale_stride_h = 0,
+    const int fp4_num_k_blocks = 1,
+    const int fp4_num_v_blocks = 1)
 {
     const int seq_idx = blockIdx.x;
     int query_loc = seq_idx * MTP;
@@ -84,7 +88,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         return;
     }
     const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);
+    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window, k_scale_stride_h, v_scale_stride_h, fp4_num_k_blocks, fp4_num_v_blocks);
 }
 
 // Grid: (num_heads, num_seqs).
@@ -164,7 +168,11 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     const float* k_scale_ptr,
     const float* v_scale_ptr,
     const AttentionVariant* variant,
-    const int sliding_window)
+    const int sliding_window,
+    const int64_t k_scale_stride_h = 0,
+    const int64_t v_scale_stride_h = 0,
+    const int fp4_num_k_blocks = 1,
+    const int fp4_num_v_blocks = 1)
 {
     UNREACHABLE_CODE
 }

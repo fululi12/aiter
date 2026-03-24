@@ -339,6 +339,10 @@ def paged_attention_v1(
     partition_size: int = 256,
     mtp: int = 1,
     sliding_window: int = 0,
+    k_scale_stride_h: int = 0,
+    v_scale_stride_h: int = 0,
+    fp4_num_k_blocks: int = 1,
+    fp4_num_v_blocks: int = 1,
 ) -> torch.Tensor:
     paged_attention_v1_core(
         out,
@@ -361,6 +365,10 @@ def paged_attention_v1(
         partition_size,
         mtp,
         sliding_window=sliding_window,
+        k_scale_stride_h=k_scale_stride_h,
+        v_scale_stride_h=v_scale_stride_h,
+        fp4_num_k_blocks=fp4_num_k_blocks,
+        fp4_num_v_blocks=fp4_num_v_blocks,
     )
     return out
 
