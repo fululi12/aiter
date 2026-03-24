@@ -50,7 +50,7 @@ def compile(
         mtp=mtp,
         sliding_window_enabled=sliding_window_enabled,
         folder=folder,
-        abi_version=9,
+        abi_version=10,
     )
 
 
@@ -279,3 +279,4 @@ if __name__ == "__main__":
     parser.add_argument("--folder", type=str, default=None)
     args = parser.parse_args()
     compile(**vars(args))
+

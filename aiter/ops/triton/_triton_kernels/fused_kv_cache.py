@@ -731,6 +731,73 @@ def _f32_to_fp4_e2m1_packed_nvfp4(
 
 
 @triton.jit
+def _amxfp4_bm_quantize_nibble(x):
+    """Quantize a single float to AMXFP4 E0M3 BM nibble.
+
+    E0M3 magnitudes: (1 + m/8) * 4.0 for m = 0..7
+    = {4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5}
+    """
+    sign = tl.where(x < 0.0, 8, 0).to(tl.int32)
+    a = tl.abs(x)
+    mag = tl.where(a < 4.25, 0,
+          tl.where(a < 4.75, 1,
+          tl.where(a < 5.25, 2,
+          tl.where(a < 5.75, 3,
+          tl.where(a < 6.25, 4,
+          tl.where(a < 6.75, 5,
+          tl.where(a < 7.25, 6, 7)))))))
+    return sign | mag
+
+
+@triton.jit
+def _f32_to_fp4_e2m1_packed_amxfp4(
+    data,
+    BLOCK_D: tl.constexpr,
+    FP4_BLOCK_SIZE: tl.constexpr = 32,
+):
+    """Quantize float32 vector to packed FP4 E2M1 with AMXFP4-style
+    per-block-32 E8M0 scales and BM (Block Maximum) E0M3 encoding.
+
+    The BM element per block uses E0M3 encoding (3 mantissa bits) for
+    higher outlier precision, while all other elements use standard E2M1.
+
+    Returns (packed_bytes, e8m0_scales, bm_indices) where:
+      - e8m0_scales: uint8 [NUM_BLOCKS]
+      - bm_indices: uint8 [NUM_BLOCKS] (BM position 0-31 within block)
+    """
+    NUM_BLOCKS: tl.constexpr = BLOCK_D // FP4_BLOCK_SIZE
+
+    data_f32 = data.to(tl.float32)
+    data_2d = tl.reshape(data_f32, (NUM_BLOCKS, FP4_BLOCK_SIZE))
+    abs_2d = tl.abs(data_2d)
+    block_absmax = tl.max(abs_2d, axis=1)
+
+    bm_indices = tl.argmax(abs_2d, axis=1).to(tl.uint8)
+
+    ideal_scales = tl.where(block_absmax > 0.0, block_absmax / 6.0, 1e-30)
+    e8m0_scales = _float_to_e8m0(ideal_scales)
+    float_scales = _e8m0_to_float(e8m0_scales)
+    float_scales = tl.where(float_scales > 0.0, float_scales, 1e-30)
+
+    scaled_2d = data_2d / float_scales[:, None]
+
+    block_arange = tl.arange(0, FP4_BLOCK_SIZE)[None, :]
+    is_bm = (block_arange == bm_indices[:, None])
+
+    scaled = tl.reshape(scaled_2d, (BLOCK_D,))
+    std_nibbles = _fp4_quantize_nibbles(scaled)
+
+    bm_nibbles_2d = _amxfp4_bm_quantize_nibble(scaled_2d)
+    bm_nibbles = tl.reshape(bm_nibbles_2d, (BLOCK_D,))
+
+    is_bm_flat = tl.reshape(is_bm, (BLOCK_D,))
+    nibbles = tl.where(is_bm_flat, bm_nibbles, std_nibbles)
+
+    packed = _fp4_pack_nibbles(nibbles, BLOCK_D)
+    return packed, e8m0_scales, bm_indices
+
+
+@triton.jit
 def _fused_qk_rope_reshape_and_cache_kernel(
     q_ptr,
     k_ptr,
@@ -1425,3 +1492,4 @@ def _fused_qk_rope_cosine_cache_llama_kernel(
                     + pid_b * value_cache_stride_b
                 )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
+

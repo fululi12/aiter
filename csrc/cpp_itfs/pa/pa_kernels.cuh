@@ -21,6 +21,22 @@ __inline__ __device__ float fp8_e4m3_to_float_pa(uint8_t x) {
 // -NVFP4_SIGNAL_OFFSET < fp4_num_k/v_blocks < 0  → MXFP4 E8M0 mode
 constexpr int NVFP4_SIGNAL_OFFSET = 1000;
 
+// Threshold for AMXFP4 (Asymmetric Microscaling FP4) mode.
+// fp4_num_k/v_blocks <= -AMXFP4_SIGNAL_OFFSET  → AMXFP4 mode
+// Scale buffer: first half = E8M0 scales, second half = BM indices.
+// The BM element uses E0M3 encoding (3 mantissa bits) for finer precision.
+constexpr int AMXFP4_SIGNAL_OFFSET = 2000;
+
+// E0M3 magnitude LUT for AMXFP4 Block Maximum element:
+// (1 + m/8) * 4.0 for m = 0..7
+__constant__ float amxfp4_bm_lut_pa[8] = {
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f
+};
+// Standard E2M1 magnitude LUT for correction reference:
+__constant__ float fp4_e2m1_lut_pa[8] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f
+};
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
@@ -234,12 +250,14 @@ _paged_attention_kernel(const int* block_table_seq,
     constexpr int FP4_MAX_K_BLOCKS = 16;  // head_size up to 512
     constexpr int FP4_MAX_V_BLOCKS = 8;
     float k_block_scales[TLOOP][FP4_MAX_K_BLOCKS];
+    uint8_t k_bm_idx_local[TLOOP][FP4_MAX_K_BLOCKS];
     float v_token_scales[TLOOP];
     float k_token_scales[TLOOP];
 
     // Shared memory for per-block V scales: V MFMA needs cross-warp access
     constexpr int V_SCALE_SMEM_TOKENS = TOKENS_PER_WARP * NWARPS;
     __shared__ float v_blk_scale_smem[V_SCALE_SMEM_TOKENS * FP4_MAX_V_BLOCKS];
+    __shared__ uint8_t v_bm_idx_smem[V_SCALE_SMEM_TOKENS * FP4_MAX_V_BLOCKS];
 
 
     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
@@ -266,6 +284,27 @@ _paged_attention_kernel(const int* block_table_seq,
             if (fp4_num_k_blocks == 0) {
                 // Per-channel K mode: K channel scales absorbed into Q
                 // in Python before the PA call.  No per-token K scale.
+                token_k_scale = 1.0f;
+            } else if (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET) {
+                // AMXFP4 mode: E8M0 scales + BM indices packed in one buffer.
+                // First half = E8M0 scales, second half = BM indices.
+                const int actual_k_blocks = -(fp4_num_k_blocks + AMXFP4_SIGNAL_OFFSET);
+                const uint8_t* k_data_ptr =
+                    reinterpret_cast<const uint8_t*>(k_scale_ptr);
+                const int64_t k_blk_stride =
+                    effective_stride / (actual_k_blocks * 2);
+                for (int b = 0; b < actual_k_blocks; b++) {
+                    const int64_t scale_idx = kv_head_idx * effective_stride
+                                              + b * k_blk_stride
+                                              + physical_token_idx;
+                    uint8_t e8m0 = k_data_ptr[scale_idx];
+                    k_block_scales[token_depth][b] =
+                        exp2f(static_cast<float>(e8m0) - 127.0f);
+                    const int64_t bm_idx_offset = kv_head_idx * effective_stride
+                                                  + (actual_k_blocks + b) * k_blk_stride
+                                                  + physical_token_idx;
+                    k_bm_idx_local[token_depth][b] = k_data_ptr[bm_idx_offset];
+                }
                 token_k_scale = 1.0f;
             } else if (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET) {
                 // NVFP4 E4M3 mode: scales stored as uint8, FP8 E4M3 format.
@@ -319,7 +358,28 @@ _paged_attention_kernel(const int* block_table_seq,
                 ? v_scale_stride_h
                 : effective_stride;
 
-            if (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET) {
+            if (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET) {
+                // AMXFP4 mode for V scales: E8M0 + BM indices packed
+                const int actual_v_blocks = -(fp4_num_v_blocks + AMXFP4_SIGNAL_OFFSET);
+                const uint8_t* v_data_ptr =
+                    reinterpret_cast<const uint8_t*>(v_scale_ptr);
+                const int64_t v_blk_stride =
+                    v_eff_stride / (actual_v_blocks * 2);
+                for (int b = 0; b < actual_v_blocks; b++) {
+                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
+                                                + b * v_blk_stride
+                                                + physical_token_idx;
+                    uint8_t e8m0 = v_data_ptr[v_scale_idx];
+                    float vbs = exp2f(static_cast<float>(e8m0) - 127.0f);
+                    v_blk_scale_smem[klocal_token_idx * actual_v_blocks + b] = vbs;
+                    const int64_t bm_idx_offset = kv_head_idx * v_eff_stride
+                                                  + (actual_v_blocks + b) * v_blk_stride
+                                                  + physical_token_idx;
+                    v_bm_idx_smem[klocal_token_idx * actual_v_blocks + b] =
+                        v_data_ptr[bm_idx_offset];
+                }
+                token_v_scale = 1.0f;
+            } else if (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET) {
                 // NVFP4 E4M3 mode for V scales
                 const int actual_v_blocks = -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET);
                 const uint8_t* v_fp8_ptr =
@@ -596,15 +656,18 @@ _paged_attention_kernel(const int* block_table_seq,
                                 _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8_fp4, qkratio * 4);
 
                                 // Per-block K scale pre-multiply: works for fp32
-                                // (fp4_num_k_blocks > 1), MXFP4 E8M0 (<0), and
-                                // NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET) block scales.
+                                // (fp4_num_k_blocks > 1), MXFP4 E8M0 (<0),
+                                // NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET),
+                                // and AMXFP4 (<= -AMXFP4_SIGNAL_OFFSET) block scales.
                                 {
                                     const int abs_k_blocks =
-                                        (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET)
-                                            ? -(fp4_num_k_blocks + NVFP4_SIGNAL_OFFSET)
-                                            : (fp4_num_k_blocks < 0)
-                                                ? -fp4_num_k_blocks
-                                                : fp4_num_k_blocks;
+                                        (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET)
+                                            ? -(fp4_num_k_blocks + AMXFP4_SIGNAL_OFFSET)
+                                            : (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET)
+                                                ? -(fp4_num_k_blocks + NVFP4_SIGNAL_OFFSET)
+                                                : (fp4_num_k_blocks < 0)
+                                                    ? -fp4_num_k_blocks
+                                                    : fp4_num_k_blocks;
                                     if (abs_k_blocks > 1) {
                                     const int head_elem =
                                         row_head_elem
@@ -619,6 +682,36 @@ _paged_attention_kernel(const int* block_table_seq,
                                         float f = to_float<scalar_t>(kvals[e])
                                                   * k_blk_scale;
                                         kvals[e] = from_float<scalar_t>(f);
+                                    }
+
+                                    // AMXFP4 BM correction: the BM element was encoded
+                                    // with E0M3 but decoded as E2M1 by the intrinsic.
+                                    // Correct the single BM element per block.
+                                    if (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET) {
+                                        const int bm_pos =
+                                            static_cast<int>(k_bm_idx_local[token_depth][k_blk]);
+                                        const int chunk_start =
+                                            (head_elem + qkratio * 8) % FP4_QUANT_BLOCK_SIZE;
+                                        const int bm_in_chunk = bm_pos - chunk_start;
+                                        if (bm_in_chunk >= 0 && bm_in_chunk < 8) {
+                                            const int byte_idx = bm_in_chunk / 2;
+                                            const int nibble_in_byte = bm_in_chunk % 2;
+                                            uint8_t* packed =
+                                                reinterpret_cast<uint8_t*>(&Ktmp8x8_fp4);
+                                            uint8_t raw_byte =
+                                                packed[qkratio * 4 + byte_idx];
+                                            uint8_t nibble = (nibble_in_byte == 0)
+                                                ? (raw_byte & 0xF)
+                                                : (raw_byte >> 4);
+                                            float bm_mag =
+                                                amxfp4_bm_lut_pa[nibble & 0x7];
+                                            float sign_f =
+                                                (nibble & 0x8) ? -1.0f : 1.0f;
+                                            float corrected =
+                                                sign_f * bm_mag * k_blk_scale;
+                                            kvals[bm_in_chunk] =
+                                                from_float<scalar_t>(corrected);
+                                        }
                                     }
                                     }
                                 }
@@ -1084,19 +1177,24 @@ _paged_attention_kernel(const int* block_table_seq,
                                 {
                                     // V per-block dequant: works for fp32
                                     // (fp4_num_v_blocks > 1), MXFP4 E8M0 (<0),
-                                    // and NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET)
+                                    // NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET),
+                                    // and AMXFP4 (<= -AMXFP4_SIGNAL_OFFSET)
                                     const int abs_v_blocks =
-                                        (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET)
-                                            ? -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET)
-                                            : (fp4_num_v_blocks < 0)
-                                                ? -fp4_num_v_blocks
-                                                : fp4_num_v_blocks;
+                                        (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET)
+                                            ? -(fp4_num_v_blocks + AMXFP4_SIGNAL_OFFSET)
+                                            : (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET)
+                                                ? -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET)
+                                                : (fp4_num_v_blocks < 0)
+                                                    ? -fp4_num_v_blocks
+                                                    : fp4_num_v_blocks;
                                     if (abs_v_blocks > 1) {
                                     const int v_blk =
                                         (vhe_depth * NWARPS * 16 + warpid * 16) / FP4_QUANT_BLOCK_SIZE;
                                     const int vlocal_tok =
                                         rowid * VTOKENS_PER_LANE
                                         + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                                    const int v_bm_offset_in_blk =
+                                        (vhe_depth * NWARPS * 16 + warpid * 16) % FP4_QUANT_BLOCK_SIZE;
                                     scalar_t* vvals =
                                         reinterpret_cast<scalar_t*>(&Vlocaltmp);
                                     for (int bi = 0; bi < 4; bi++) {
@@ -1115,6 +1213,36 @@ _paged_attention_kernel(const int* block_table_seq,
                                             to_float<scalar_t>(vvals[base]) * s);
                                         vvals[base + 1] = from_float<scalar_t>(
                                             to_float<scalar_t>(vvals[base + 1]) * s);
+
+                                        // AMXFP4 BM correction for V
+                                        if (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET
+                                            && tok_in_part < V_SCALE_SMEM_TOKENS) {
+                                            const uint8_t v_bm_pos =
+                                                v_bm_idx_smem[tok_in_part
+                                                    * abs_v_blocks + v_blk];
+                                            const int bm_in_warp =
+                                                static_cast<int>(v_bm_pos) - v_bm_offset_in_blk;
+                                            const int bm_in_half = bm_in_warp - j * 8;
+                                            if (bm_in_half >= 0 && bm_in_half < 8
+                                                && bm_in_half / 2 == bi) {
+                                                const int which = bm_in_half % 2;
+                                                uint8_t* packed =
+                                                    reinterpret_cast<uint8_t*>(&Vtmp8x8);
+                                                uint8_t raw_byte =
+                                                    packed[j * 4 + bm_in_half / 2];
+                                                uint8_t nibble = (which == 0)
+                                                    ? (raw_byte & 0xF)
+                                                    : (raw_byte >> 4);
+                                                float bm_mag =
+                                                    amxfp4_bm_lut_pa[nibble & 0x7];
+                                                float sign_f =
+                                                    (nibble & 0x8) ? -1.0f : 1.0f;
+                                                float corrected =
+                                                    sign_f * bm_mag * s;
+                                                vvals[base + which] =
+                                                    from_float<scalar_t>(corrected);
+                                            }
+                                        }
                                     }
                                     }
                                 }
@@ -2742,3 +2870,4 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
         }
     }
 }
+
