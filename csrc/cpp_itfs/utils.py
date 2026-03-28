@@ -258,6 +258,38 @@ def not_built(folder):
     return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
 
 
+def _needs_rebuild(folder, includes=None, sources=None):
+    """Check if lib.so is stale relative to any include/source dependency."""
+    lib_path = f"{BUILD_DIR}/{folder}/lib.so"
+    if not os.path.exists(lib_path):
+        return True
+    try:
+        lib_mtime = os.path.getmtime(lib_path)
+    except OSError:
+        return True
+    deps = list(includes or []) + list(sources or [])
+    for dep in deps:
+        try:
+            if os.path.isdir(dep):
+                for root, _dirs, files in os.walk(dep):
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        if os.path.getmtime(fpath) > lib_mtime:
+                            logger.info(
+                                "Aiter JIT: %s is newer than %s/lib.so, "
+                                "triggering rebuild", fpath, folder)
+                            return True
+            elif os.path.isfile(dep):
+                if os.path.getmtime(dep) > lib_mtime:
+                    logger.info(
+                        "Aiter JIT: %s is newer than %s/lib.so, "
+                        "triggering rebuild", dep, folder)
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def compile_template_op(
     src_template,
     md_name,
@@ -274,7 +306,16 @@ def compile_template_op(
     if folder is None:
         folder = func_name
 
-    if not_built(folder):
+    need_compile = not_built(folder) or _needs_rebuild(
+        folder, includes, sources)
+    if need_compile:
+        lib_path = f"{BUILD_DIR}/{folder}/lib.so"
+        if os.path.exists(lib_path):
+            try:
+                os.remove(lib_path)
+                logger.info("Aiter JIT: removed stale %s for rebuild", lib_path)
+            except OSError:
+                pass
         if includes is None:
             includes = []
         if sources is None:
@@ -299,3 +340,4 @@ def transfer_hsaco(hsaco_path):
 
 def str_to_bool(s):
     return True if s.lower() == "true" else False
+

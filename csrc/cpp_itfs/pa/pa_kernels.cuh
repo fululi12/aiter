@@ -1089,21 +1089,62 @@ _paged_attention_kernel(const int* block_table_seq,
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
-                // read data points individually and save them into array
-                cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    const cache_t* fetched_elems = reinterpret_cast<const cache_t*>(
-                        vlds_ptr + (/*row=*/(vlocal_token_idx + d2) * n_thread_per_block +
-                                    /*col=*/vlds_col_idx) *
-                                       16);
+                    // FP4: each cache byte packs 2 head elements.
+                    // Extract the individual nibble for THIS lane's
+                    // head element from each of the 16 tokens, then
+                    // repack consecutive token-pairs into bytes so
+                    // convert_b8x8_fp4 produces bf16 ordered by token.
+                    const int fp4_byte_idx   = vlds_elem_idx / 2;
+                    const int fp4_nibble_sel = vlds_elem_idx & 1;
 
-                    elems[d2] = fetched_elems[vlds_elem_idx];
+                    uint8_t nibbles[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    {
+                        const cache_t* fe = reinterpret_cast<const cache_t*>(
+                            vlds_ptr +
+                            (/*row=*/(vlocal_token_idx + d2) *
+                                 n_thread_per_block +
+                             /*col=*/vlds_col_idx) * 16);
+                        uint8_t packed = fe[fp4_byte_idx];
+                        nibbles[d2] = fp4_nibble_sel
+                            ? ((packed >> 4) & 0xF)
+                            : (packed & 0xF);
+                    }
+
+                    // Repack: low nibble = even token, high = odd.
+                    // j=0 reads bytes[0..3]  (offset 0 in 1st _B8x8)
+                    // j=1 reads bytes[12..15] (offset 4 in 2nd _B8x8)
+                    cache_t repacked[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                        repacked[d2] = 0;
+                    for(int p = 0; p < 4; p++)
+                        repacked[p] = nibbles[2*p]
+                                    | (nibbles[2*p + 1] << 4);
+                    for(int p = 0; p < 4; p++)
+                        repacked[12 + p] = nibbles[8 + 2*p]
+                                         | (nibbles[8 + 2*p + 1] << 4);
+
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(repacked);
                 }
-
-                // copy all the read data points together
-                Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
-                    *reinterpret_cast<const _B16x8*>(elems);
+                else
+                {
+                    cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    {
+                        const cache_t* fetched_elems =
+                            reinterpret_cast<const cache_t*>(
+                                vlds_ptr +
+                                (/*row=*/(vlocal_token_idx + d2) *
+                                     n_thread_per_block +
+                                 /*col=*/vlds_col_idx) * 16);
+                        elems[d2] = fetched_elems[vlds_elem_idx];
+                    }
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(elems);
+                }
             }
             __syncthreads();
         }
@@ -1175,10 +1216,10 @@ _paged_attention_kernel(const int* block_table_seq,
                                     Vtmp8x8, j * 4);
 
                                 {
-                                    // V per-block dequant: works for fp32
-                                    // (fp4_num_v_blocks > 1), MXFP4 E8M0 (<0),
-                                    // NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET),
-                                    // and AMXFP4 (<= -AMXFP4_SIGNAL_OFFSET)
+                                    // V per-block dequant after nibble-repack fix.
+                                    // Each bf16 pair now comes from two CONSECUTIVE
+                                    // TOKENS at ONE head element (not two head
+                                    // elements from one token).
                                     const int abs_v_blocks =
                                         (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET)
                                             ? -(fp4_num_v_blocks + AMXFP4_SIGNAL_OFFSET)
@@ -1198,49 +1239,74 @@ _paged_attention_kernel(const int* block_table_seq,
                                     scalar_t* vvals =
                                         reinterpret_cast<scalar_t*>(&Vlocaltmp);
                                     for (int bi = 0; bi < 4; bi++) {
-                                        const int byte_in_16 =
-                                            (j == 0) ? bi : (12 + bi);
-                                        const int tok_in_part =
+                                        const int tok_off_0 = j * 8 + bi * 2;
+                                        const int tok_off_1 = tok_off_0 + 1;
+                                        const int tp0 =
                                             vtoken_depth * TOKENS_PER_WARP
-                                            + vlocal_tok + byte_in_16;
-                                        const float s =
-                                            (tok_in_part < V_SCALE_SMEM_TOKENS)
-                                            ? v_blk_scale_smem[tok_in_part
+                                            + vlocal_tok + tok_off_0;
+                                        const int tp1 = tp0 + 1;
+                                        const float s0 =
+                                            (tp0 < V_SCALE_SMEM_TOKENS)
+                                            ? v_blk_scale_smem[tp0
+                                                * abs_v_blocks + v_blk]
+                                            : 0.0f;
+                                        const float s1 =
+                                            (tp1 < V_SCALE_SMEM_TOKENS)
+                                            ? v_blk_scale_smem[tp1
                                                 * abs_v_blocks + v_blk]
                                             : 0.0f;
                                         const int base = bi * 2;
                                         vvals[base] = from_float<scalar_t>(
-                                            to_float<scalar_t>(vvals[base]) * s);
+                                            to_float<scalar_t>(vvals[base]) * s0);
                                         vvals[base + 1] = from_float<scalar_t>(
-                                            to_float<scalar_t>(vvals[base + 1]) * s);
+                                            to_float<scalar_t>(vvals[base + 1]) * s1);
 
                                         // AMXFP4 BM correction for V
-                                        if (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET
-                                            && tok_in_part < V_SCALE_SMEM_TOKENS) {
-                                            const uint8_t v_bm_pos =
-                                                v_bm_idx_smem[tok_in_part
-                                                    * abs_v_blocks + v_blk];
-                                            const int bm_in_warp =
-                                                static_cast<int>(v_bm_pos) - v_bm_offset_in_blk;
-                                            const int bm_in_half = bm_in_warp - j * 8;
-                                            if (bm_in_half >= 0 && bm_in_half < 8
-                                                && bm_in_half / 2 == bi) {
-                                                const int which = bm_in_half % 2;
-                                                uint8_t* packed =
-                                                    reinterpret_cast<uint8_t*>(&Vtmp8x8);
-                                                uint8_t raw_byte =
-                                                    packed[j * 4 + bm_in_half / 2];
-                                                uint8_t nibble = (which == 0)
-                                                    ? (raw_byte & 0xF)
-                                                    : (raw_byte >> 4);
-                                                float bm_mag =
-                                                    amxfp4_bm_lut_pa[nibble & 0x7];
-                                                float sign_f =
-                                                    (nibble & 0x8) ? -1.0f : 1.0f;
-                                                float corrected =
-                                                    sign_f * bm_mag * s;
-                                                vvals[base + which] =
-                                                    from_float<scalar_t>(corrected);
+                                        if (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET) {
+                                            if (tp0 < V_SCALE_SMEM_TOKENS) {
+                                                const uint8_t bm0 =
+                                                    v_bm_idx_smem[tp0
+                                                        * abs_v_blocks + v_blk];
+                                                const int bm_in_warp0 =
+                                                    static_cast<int>(bm0)
+                                                    - v_bm_offset_in_blk;
+                                                if (bm_in_warp0 == lane16id) {
+                                                    uint8_t* pk =
+                                                        reinterpret_cast<uint8_t*>(
+                                                            &Vtmp8x8);
+                                                    uint8_t nib =
+                                                        pk[j * 4 + bi] & 0xF;
+                                                    float mag =
+                                                        amxfp4_bm_lut_pa[nib & 0x7];
+                                                    float sgn =
+                                                        (nib & 0x8) ? -1.0f : 1.0f;
+                                                    vvals[base] =
+                                                        from_float<scalar_t>(
+                                                            sgn * mag * s0);
+                                                }
+                                            }
+                                            if (tp1 < V_SCALE_SMEM_TOKENS) {
+                                                const uint8_t bm1 =
+                                                    v_bm_idx_smem[tp1
+                                                        * abs_v_blocks + v_blk];
+                                                const int bm_in_warp1 =
+                                                    static_cast<int>(bm1)
+                                                    - v_bm_offset_in_blk;
+                                                if (bm_in_warp1 == lane16id) {
+                                                    uint8_t* pk =
+                                                        reinterpret_cast<uint8_t*>(
+                                                            &Vtmp8x8);
+                                                    uint8_t nib =
+                                                        (pk[j * 4 + bi] >> 4)
+                                                        & 0xF;
+                                                    float mag =
+                                                        amxfp4_bm_lut_pa[nib & 0x7];
+                                                    float sgn =
+                                                        (nib & 0x8) ? -1.0f : 1.0f;
+                                                    vvals[base + 1] =
+                                                        from_float<scalar_t>(
+                                                            sgn * mag * s1);
+                                                }
                                             }
                                         }
                                     }
@@ -2527,25 +2593,51 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
             for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++) // 2
             {
                 const int vlds_col_idx = laneid % n_thread_per_block;
-                const int vhead_elem =
-                    vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                const cache_t* v_ptr2 = v_ptr + vhead_elem;
 
-                const int64_t vblock_number =
-                    static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
-                const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
-
-                // Jacob: Non temporal load for large batch size
-                const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
-                if constexpr(NT_KV_LOAD)
+                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
-                        load_ntmprl_16Byte(v_fetch_ptr_16B);
+                    const int vhead_elem_fp4 =
+                        vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                    const int vhead_elem = vhead_elem_fp4 / 2;
+                    const cache_t* v_ptr2 = v_ptr + vhead_elem;
+
+                    const int64_t vblock_number =
+                        static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
+                    const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
+
+                    union {
+                        uint64_t u64;
+                        _B16x8 b16x8;
+                    } loaded_data;
+                    loaded_data.u64 = *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
+                    _B8x16 temp;
+                    temp.xy[0] = *reinterpret_cast<_B8x8*>(&loaded_data.u64);
+                    temp.xy[1] = temp.xy[0];
+                    loaded_data.b16x8 = *reinterpret_cast<_B16x8*>(&temp);
+
+                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] = loaded_data.b16x8;
                 }
                 else
                 {
-                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
-                        *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                    const int vhead_elem =
+                        vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                    const cache_t* v_ptr2 = v_ptr + vhead_elem;
+
+                    const int64_t vblock_number =
+                        static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
+                    const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
+
+                    const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                    if constexpr(NT_KV_LOAD)
+                    {
+                        Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
+                            load_ntmprl_16Byte(v_fetch_ptr_16B);
+                    }
+                    else
+                    {
+                        Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
+                            *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                    }
                 }
             }
         }
@@ -2582,21 +2674,54 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
-                // read data points individually and save them into array
-                cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    const cache_t* fetched_elems = reinterpret_cast<const cache_t*>(
-                        vlds_ptr + (/*row=*/(vlocal_token_idx + d2) * n_thread_per_block +
-                                    /*col=*/vlds_col_idx) *
-                                       16);
+                    const int fp4_byte_idx   = vlds_elem_idx / 2;
+                    const int fp4_nibble_sel = vlds_elem_idx & 1;
 
-                    elems[d2] = fetched_elems[vlds_elem_idx];
+                    uint8_t nibbles[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    {
+                        const cache_t* fe = reinterpret_cast<const cache_t*>(
+                            vlds_ptr +
+                            (/*row=*/(vlocal_token_idx + d2) *
+                                 n_thread_per_block +
+                             /*col=*/vlds_col_idx) * 16);
+                        uint8_t packed = fe[fp4_byte_idx];
+                        nibbles[d2] = fp4_nibble_sel
+                            ? ((packed >> 4) & 0xF)
+                            : (packed & 0xF);
+                    }
+
+                    cache_t repacked[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                        repacked[d2] = 0;
+                    for(int p = 0; p < 4; p++)
+                        repacked[p] = nibbles[2*p]
+                                    | (nibbles[2*p + 1] << 4);
+                    for(int p = 0; p < 4; p++)
+                        repacked[12 + p] = nibbles[8 + 2*p]
+                                         | (nibbles[8 + 2*p + 1] << 4);
+
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(repacked);
                 }
-
-                // copy all the read data points together
-                Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
-                    *reinterpret_cast<const _B16x8*>(elems);
+                else
+                {
+                    cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    {
+                        const cache_t* fetched_elems =
+                            reinterpret_cast<const cache_t*>(
+                                vlds_ptr +
+                                (/*row=*/(vlocal_token_idx + d2) *
+                                     n_thread_per_block +
+                                 /*col=*/vlds_col_idx) * 16);
+                        elems[d2] = fetched_elems[vlds_elem_idx];
+                    }
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(elems);
+                }
             }
             __syncthreads();
         }
@@ -2653,8 +2778,10 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                     }
                     else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                     {
-                        // FP4 V cache: convert to BF16, use BF16 MFMA
-                        // Use FP8's offset calculation since FP4 uses FP8's Q layout
+                        // FP4 V MFMA: convert packed FP4 to BF16, then use BF16 MFMA.
+                        // NOTE: V block scale application is handled in the main
+                        // _paged_attention_kernel; this experimental path only does
+                        // basic dequantization (no per-block-32 scale correction).
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
                             _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
@@ -2664,7 +2791,6 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                 _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
                                 _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8, j * 4);
 
-                                // Use FP8's offset calculation: rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO
                                 const int offset =
                                     rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO +
                                     j * ELEMS8_ELEMS4_RATIO;
