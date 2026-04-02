@@ -652,13 +652,11 @@ _paged_attention_kernel(const int* block_table_seq,
                             {
                                 _B8x8 Ktmp8x8_fp4 = Ktmp8x16.xy[qkratio];
                                 
-                                // Convert FP4: qkratio*4 is byte offset
-                                _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8_fp4, qkratio * 4);
-
-                                // Per-block K scale pre-multiply: works for fp32
-                                // (fp4_num_k_blocks > 1), MXFP4 E8M0 (<0),
-                                // NVFP4 E4M3 (<= -NVFP4_SIGNAL_OFFSET),
-                                // and AMXFP4 (<= -AMXFP4_SIGNAL_OFFSET) block scales.
+                                // Per-block K scale: fold into the HW
+                                // FP4→BF16/FP16 intrinsic when possible,
+                                // eliminating 8 to_float + 8 from_float +
+                                // 8 multiply per chunk.
+                                _B16x8 Klocaltmp;
                                 {
                                     const int abs_k_blocks =
                                         (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET)
@@ -676,17 +674,12 @@ _paged_attention_kernel(const int* block_table_seq,
                                     const int k_blk = head_elem / FP4_QUANT_BLOCK_SIZE;
                                     const float k_blk_scale =
                                         k_block_scales[token_depth][k_blk];
-                                    scalar_t* kvals =
-                                        reinterpret_cast<scalar_t*>(&Klocaltmp);
-                                    for (int e = 0; e < 8; e++) {
-                                        float f = to_float<scalar_t>(kvals[e])
-                                                  * k_blk_scale;
-                                        kvals[e] = from_float<scalar_t>(f);
-                                    }
+                                    const float k_sc4[4] = {
+                                        k_blk_scale, k_blk_scale,
+                                        k_blk_scale, k_blk_scale};
+                                    Klocaltmp = convert_b8x8_fp4_scaled<scalar_t>(
+                                        Ktmp8x8_fp4, qkratio * 4, k_sc4);
 
-                                    // AMXFP4 BM correction: the BM element was encoded
-                                    // with E0M3 but decoded as E2M1 by the intrinsic.
-                                    // Correct the single BM element per block.
                                     if (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET) {
                                         const int bm_pos =
                                             static_cast<int>(k_bm_idx_local[token_depth][k_blk]);
@@ -709,10 +702,15 @@ _paged_attention_kernel(const int* block_table_seq,
                                                 (nibble & 0x8) ? -1.0f : 1.0f;
                                             float corrected =
                                                 sign_f * bm_mag * k_blk_scale;
+                                            scalar_t* kvals =
+                                                reinterpret_cast<scalar_t*>(&Klocaltmp);
                                             kvals[bm_in_chunk] =
                                                 from_float<scalar_t>(corrected);
                                         }
                                     }
+                                    } else {
+                                    Klocaltmp = convert_b8x8_fp4<scalar_t>(
+                                        Ktmp8x8_fp4, qkratio * 4);
                                     }
                                 }
 
