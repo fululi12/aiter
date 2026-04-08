@@ -245,8 +245,9 @@ _paged_attention_kernel(const int* block_table_seq,
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
 
 
-    // Per-block K/V scales (FP4 per-block-32 support)
-    constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+    // Per-block K/V scales: block size is determined dynamically from
+    // HEAD_SIZE / fp4_abs_blocks so that both the default mode (block-64)
+    // and legacy modes (MXFP4/NVFP4/AMXFP4, block-32) work correctly.
     constexpr int FP4_MAX_K_BLOCKS = 16;  // head_size up to 512
     constexpr int FP4_MAX_V_BLOCKS = 8;
     float k_block_scales[TLOOP][FP4_MAX_K_BLOCKS];
@@ -259,6 +260,48 @@ _paged_attention_kernel(const int* block_table_seq,
     __shared__ float v_blk_scale_smem[V_SCALE_SMEM_TOKENS * FP4_MAX_V_BLOCKS];
     __shared__ uint8_t v_bm_idx_smem[V_SCALE_SMEM_TOKENS * FP4_MAX_V_BLOCKS];
 
+    const int fp4_abs_k_blocks =
+        (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET)
+            ? -(fp4_num_k_blocks + AMXFP4_SIGNAL_OFFSET)
+            : (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET)
+                ? -(fp4_num_k_blocks + NVFP4_SIGNAL_OFFSET)
+                : (fp4_num_k_blocks < 0)
+                    ? -fp4_num_k_blocks
+                    : fp4_num_k_blocks;
+    const bool fp4_k_is_amxfp4 = (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET);
+
+    const int fp4_abs_v_blocks =
+        (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET)
+            ? -(fp4_num_v_blocks + AMXFP4_SIGNAL_OFFSET)
+            : (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET)
+                ? -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET)
+                : (fp4_num_v_blocks < 0)
+                    ? -fp4_num_v_blocks
+                    : fp4_num_v_blocks;
+    const bool fp4_v_is_amxfp4 = (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET);
+
+    const int64_t fp4_k_eff_stride =
+        (k_scale_stride_h > 0) ? k_scale_stride_h
+                               : static_cast<int64_t>(32) * 1024 * 1024;
+    const int64_t fp4_v_eff_stride =
+        (v_scale_stride_h > 0) ? v_scale_stride_h : fp4_k_eff_stride;
+    const int64_t fp4_k_blk_stride =
+        (fp4_abs_k_blocks > 1)
+            ? (fp4_k_is_amxfp4 ? fp4_k_eff_stride / (fp4_abs_k_blocks * 2)
+                               : fp4_k_eff_stride / fp4_abs_k_blocks)
+            : fp4_k_eff_stride;
+    const int64_t fp4_v_blk_stride =
+        (fp4_abs_v_blocks > 1)
+            ? (fp4_v_is_amxfp4 ? fp4_v_eff_stride / (fp4_abs_v_blocks * 2)
+                               : fp4_v_eff_stride / fp4_abs_v_blocks)
+            : fp4_v_eff_stride;
+    const int64_t fp4_k_head_base = kv_head_idx * fp4_k_eff_stride;
+    const int64_t fp4_v_head_base = kv_head_idx * fp4_v_eff_stride;
+
+    const int fp4_k_block_size =
+        (fp4_abs_k_blocks > 1) ? (HEAD_SIZE / fp4_abs_k_blocks) : HEAD_SIZE;
+    const int fp4_v_block_size =
+        (fp4_abs_v_blocks > 1) ? (HEAD_SIZE / fp4_abs_v_blocks) : HEAD_SIZE;
 
     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
     // fetch K values
@@ -277,151 +320,122 @@ _paged_attention_kernel(const int* block_table_seq,
         {
             const int64_t physical_token_idx = kblock_number * BLOCK_SIZE + kphysical_block_offset;
 
-            const int64_t effective_stride = (k_scale_stride_h > 0)
-                ? k_scale_stride_h
-                : static_cast<int64_t>(32) * 1024 * 1024;
-
             if (fp4_num_k_blocks == 0) {
-                // Per-channel K mode: K channel scales absorbed into Q
-                // in Python before the PA call.  No per-token K scale.
                 token_k_scale = 1.0f;
             } else if (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET) {
-                // AMXFP4 mode: E8M0 scales + BM indices packed in one buffer.
-                // First half = E8M0 scales, second half = BM indices.
-                const int actual_k_blocks = -(fp4_num_k_blocks + AMXFP4_SIGNAL_OFFSET);
                 const uint8_t* k_data_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
-                const int64_t k_blk_stride =
-                    effective_stride / (actual_k_blocks * 2);
-                for (int b = 0; b < actual_k_blocks; b++) {
-                    const int64_t scale_idx = kv_head_idx * effective_stride
-                                              + b * k_blk_stride
+                for (int b = 0; b < fp4_abs_k_blocks; b++) {
+                    const int64_t scale_idx = fp4_k_head_base
+                                              + b * fp4_k_blk_stride
                                               + physical_token_idx;
                     uint8_t e8m0 = k_data_ptr[scale_idx];
                     k_block_scales[token_depth][b] =
                         exp2f(static_cast<float>(e8m0) - 127.0f);
-                    const int64_t bm_idx_offset = kv_head_idx * effective_stride
-                                                  + (actual_k_blocks + b) * k_blk_stride
+                    const int64_t bm_idx_offset = fp4_k_head_base
+                                                  + (fp4_abs_k_blocks + b) * fp4_k_blk_stride
                                                   + physical_token_idx;
                     k_bm_idx_local[token_depth][b] = k_data_ptr[bm_idx_offset];
                 }
                 token_k_scale = 1.0f;
             } else if (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET) {
-                // NVFP4 E4M3 mode: scales stored as uint8, FP8 E4M3 format.
-                // Provides ~3 mantissa bits of precision per scale vs 0 for E8M0.
-                const int actual_k_blocks = -(fp4_num_k_blocks + NVFP4_SIGNAL_OFFSET);
                 const uint8_t* k_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
-                const int64_t k_blk_stride = effective_stride / actual_k_blocks;
-                for (int b = 0; b < actual_k_blocks; b++) {
-                    const int64_t scale_idx = kv_head_idx * effective_stride
-                                              + b * k_blk_stride
+                for (int b = 0; b < fp4_abs_k_blocks; b++) {
+                    const int64_t scale_idx = fp4_k_head_base
+                                              + b * fp4_k_blk_stride
                                               + physical_token_idx;
                     uint8_t fp8_val = k_fp8_ptr[scale_idx];
                     k_block_scales[token_depth][b] = fp8_e4m3_to_float_pa(fp8_val);
                 }
                 token_k_scale = 1.0f;
             } else if (fp4_num_k_blocks < 0) {
-                // MXFP4 E8M0 mode: scales stored as uint8, power-of-2 values.
-                // Negative value signals MXFP4; actual block count = abs().
-                // Scale pointer is reinterpreted as uint8_t*.
-                const int actual_k_blocks = -fp4_num_k_blocks;
                 const uint8_t* k_e8m0_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
-                const int64_t k_blk_stride = effective_stride / actual_k_blocks;
-                for (int b = 0; b < actual_k_blocks; b++) {
-                    const int64_t scale_idx = kv_head_idx * effective_stride
-                                              + b * k_blk_stride
+                for (int b = 0; b < fp4_abs_k_blocks; b++) {
+                    const int64_t scale_idx = fp4_k_head_base
+                                              + b * fp4_k_blk_stride
                                               + physical_token_idx;
                     uint8_t e8m0 = k_e8m0_ptr[scale_idx];
                     k_block_scales[token_depth][b] =
                         exp2f(static_cast<float>(e8m0) - 127.0f);
                 }
                 token_k_scale = 1.0f;
-            } else if (fp4_num_k_blocks > 1) {
-                // Per-block K scales: layout [num_heads * num_k_blocks, total_tokens]
-                // stride_h = num_k_blocks * total_tokens
-                const int64_t k_blk_stride = effective_stride / fp4_num_k_blocks;
-                for (int b = 0; b < fp4_num_k_blocks; b++) {
-                    const int64_t scale_idx = kv_head_idx * effective_stride
-                                              + b * k_blk_stride
+            } else if (fp4_abs_k_blocks > 1) {
+                const uint8_t* k_fp8_ptr =
+                    reinterpret_cast<const uint8_t*>(k_scale_ptr);
+                for (int b = 0; b < fp4_abs_k_blocks; b++) {
+                    const int64_t scale_idx = fp4_k_head_base
+                                              + b * fp4_k_blk_stride
                                               + physical_token_idx;
-                    k_block_scales[token_depth][b] = k_scale_ptr[scale_idx];
+                    k_block_scales[token_depth][b] =
+                        fp8_e4m3_to_float_pa(k_fp8_ptr[scale_idx]);
                 }
-                token_k_scale = 1.0f;  // K pre-scaled, no post-MFMA multiply
+                token_k_scale = 1.0f;
             } else {
-                const int64_t scale_idx = kv_head_idx * effective_stride + physical_token_idx;
-                token_k_scale = k_scale_ptr[scale_idx];
+                const uint8_t* k_fp8_ptr =
+                    reinterpret_cast<const uint8_t*>(k_scale_ptr);
+                const int64_t scale_idx = fp4_k_head_base + physical_token_idx;
+                token_k_scale = fp8_e4m3_to_float_pa(k_fp8_ptr[scale_idx]);
             }
 
-            const int64_t v_eff_stride = (v_scale_stride_h > 0)
-                ? v_scale_stride_h
-                : effective_stride;
-
             if (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET) {
-                // AMXFP4 mode for V scales: E8M0 + BM indices packed
-                const int actual_v_blocks = -(fp4_num_v_blocks + AMXFP4_SIGNAL_OFFSET);
                 const uint8_t* v_data_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
-                const int64_t v_blk_stride =
-                    v_eff_stride / (actual_v_blocks * 2);
-                for (int b = 0; b < actual_v_blocks; b++) {
-                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
-                                                + b * v_blk_stride
+                for (int b = 0; b < fp4_abs_v_blocks; b++) {
+                    const int64_t v_scale_idx = fp4_v_head_base
+                                                + b * fp4_v_blk_stride
                                                 + physical_token_idx;
                     uint8_t e8m0 = v_data_ptr[v_scale_idx];
                     float vbs = exp2f(static_cast<float>(e8m0) - 127.0f);
-                    v_blk_scale_smem[klocal_token_idx * actual_v_blocks + b] = vbs;
-                    const int64_t bm_idx_offset = kv_head_idx * v_eff_stride
-                                                  + (actual_v_blocks + b) * v_blk_stride
+                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
+                    const int64_t bm_idx_offset = fp4_v_head_base
+                                                  + (fp4_abs_v_blocks + b) * fp4_v_blk_stride
                                                   + physical_token_idx;
-                    v_bm_idx_smem[klocal_token_idx * actual_v_blocks + b] =
+                    v_bm_idx_smem[klocal_token_idx * fp4_abs_v_blocks + b] =
                         v_data_ptr[bm_idx_offset];
                 }
                 token_v_scale = 1.0f;
             } else if (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET) {
-                // NVFP4 E4M3 mode for V scales
-                const int actual_v_blocks = -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET);
                 const uint8_t* v_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
-                const int64_t v_blk_stride = v_eff_stride / actual_v_blocks;
-                for (int b = 0; b < actual_v_blocks; b++) {
-                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
-                                                + b * v_blk_stride
+                for (int b = 0; b < fp4_abs_v_blocks; b++) {
+                    const int64_t v_scale_idx = fp4_v_head_base
+                                                + b * fp4_v_blk_stride
                                                 + physical_token_idx;
                     uint8_t fp8_val = v_fp8_ptr[v_scale_idx];
                     float vbs = fp8_e4m3_to_float_pa(fp8_val);
-                    v_blk_scale_smem[klocal_token_idx * actual_v_blocks + b] = vbs;
+                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
                 }
                 token_v_scale = 1.0f;
             } else if (fp4_num_v_blocks < 0) {
-                // MXFP4 E8M0 mode for V scales
-                const int actual_v_blocks = -fp4_num_v_blocks;
                 const uint8_t* v_e8m0_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
-                const int64_t v_blk_stride = v_eff_stride / actual_v_blocks;
-                for (int b = 0; b < actual_v_blocks; b++) {
-                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
-                                                + b * v_blk_stride
+                for (int b = 0; b < fp4_abs_v_blocks; b++) {
+                    const int64_t v_scale_idx = fp4_v_head_base
+                                                + b * fp4_v_blk_stride
                                                 + physical_token_idx;
                     uint8_t e8m0 = v_e8m0_ptr[v_scale_idx];
                     float vbs = exp2f(static_cast<float>(e8m0) - 127.0f);
-                    v_blk_scale_smem[klocal_token_idx * actual_v_blocks + b] = vbs;
+                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
                 }
                 token_v_scale = 1.0f;
-            } else if (fp4_num_v_blocks > 1) {
-                const int64_t v_blk_stride = v_eff_stride / fp4_num_v_blocks;
-                for (int b = 0; b < fp4_num_v_blocks; b++) {
-                    const int64_t v_scale_idx = kv_head_idx * v_eff_stride
-                                                + b * v_blk_stride
+            } else if (fp4_abs_v_blocks > 1) {
+                const uint8_t* v_fp8_ptr =
+                    reinterpret_cast<const uint8_t*>(v_scale_ptr);
+                for (int b = 0; b < fp4_abs_v_blocks; b++) {
+                    const int64_t v_scale_idx = fp4_v_head_base
+                                                + b * fp4_v_blk_stride
                                                 + physical_token_idx;
-                    float vbs = v_scale_ptr[v_scale_idx];
-                    v_blk_scale_smem[klocal_token_idx * fp4_num_v_blocks + b] = vbs;
+                    float vbs = fp8_e4m3_to_float_pa(v_fp8_ptr[v_scale_idx]);
+                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
                 }
-                token_v_scale = 1.0f;  // V pre-scaled via intrinsic
+                token_v_scale = 1.0f;
             } else {
-                const int64_t v_scale_idx = kv_head_idx * v_eff_stride + physical_token_idx;
-                token_v_scale = v_scale_ptr[v_scale_idx];
+                const uint8_t* v_fp8_ptr =
+                    reinterpret_cast<const uint8_t*>(v_scale_ptr);
+                const int64_t v_scale_idx = fp4_v_head_base + physical_token_idx;
+                token_v_scale = fp8_e4m3_to_float_pa(v_fp8_ptr[v_scale_idx]);
             }
         }
         k_token_scales[token_depth] = token_k_scale;
@@ -606,26 +620,6 @@ _paged_attention_kernel(const int* block_table_seq,
         }
     }();
 
-    const int fp4_abs_k_blocks =
-        (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET)
-            ? -(fp4_num_k_blocks + AMXFP4_SIGNAL_OFFSET)
-            : (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET)
-                ? -(fp4_num_k_blocks + NVFP4_SIGNAL_OFFSET)
-                : (fp4_num_k_blocks < 0)
-                    ? -fp4_num_k_blocks
-                    : fp4_num_k_blocks;
-    const bool fp4_k_is_amxfp4 = (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET);
-
-    const int fp4_abs_v_blocks =
-        (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET)
-            ? -(fp4_num_v_blocks + AMXFP4_SIGNAL_OFFSET)
-            : (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET)
-                ? -(fp4_num_v_blocks + NVFP4_SIGNAL_OFFSET)
-                : (fp4_num_v_blocks < 0)
-                    ? -fp4_num_v_blocks
-                    : fp4_num_v_blocks;
-    const bool fp4_v_is_amxfp4 = (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET);
-
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     // qk mfma
     for(int mtp = 0; mtp < mtp_loop; mtp++)
@@ -683,7 +677,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                         row_head_elem
                                         + qkhe_depth * QKHE_PER_FETCH
                                         + head_loop * HEAD_SIZE_PER_LOOP;
-                                    const int k_blk = head_elem / FP4_QUANT_BLOCK_SIZE;
+                                    const int k_blk = head_elem / fp4_k_block_size;
                                     const float k_blk_scale =
                                         k_block_scales[token_depth][k_blk];
                                     scalar_t* kvals =
@@ -698,7 +692,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                         const int bm_pos =
                                             static_cast<int>(k_bm_idx_local[token_depth][k_blk]);
                                         const int chunk_start =
-                                            (head_elem + qkratio * 8) % FP4_QUANT_BLOCK_SIZE;
+                                            (head_elem + qkratio * 8) % fp4_k_block_size;
                                         const int bm_in_chunk = bm_pos - chunk_start;
                                         if (bm_in_chunk >= 0 && bm_in_chunk < 8) {
                                             const int byte_idx = bm_in_chunk / 2;
@@ -1227,12 +1221,12 @@ _paged_attention_kernel(const int* block_table_seq,
                                 {
                                     if (fp4_abs_v_blocks > 1) {
                                     const int v_blk =
-                                        (vhe_depth * NWARPS * 16 + warpid * 16) / FP4_QUANT_BLOCK_SIZE;
+                                        (vhe_depth * NWARPS * 16 + warpid * 16) / fp4_v_block_size;
                                     const int vlocal_tok =
                                         rowid * VTOKENS_PER_LANE
                                         + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
                                     const int v_bm_offset_in_blk =
-                                        (vhe_depth * NWARPS * 16 + warpid * 16) % FP4_QUANT_BLOCK_SIZE;
+                                        (vhe_depth * NWARPS * 16 + warpid * 16) % fp4_v_block_size;
                                     scalar_t* vvals =
                                         reinterpret_cast<scalar_t*>(&Vlocaltmp);
                                     for (int bi = 0; bi < 4; bi++) {
