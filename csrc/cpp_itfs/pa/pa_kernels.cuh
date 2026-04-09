@@ -355,13 +355,16 @@ _paged_attention_kernel(const int* block_table_seq,
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
                 const int64_t k_nvfp4_base =
                     fp4_k_head_base + physical_token_idx;
+                uint8_t k_nv_raw[FP4_MAX_K_BLOCKS];
                 #pragma unroll
                 for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
-                    if (b < fp4_abs_k_blocks) {
-                        k_block_scales[token_depth][b] =
-                            fp8_e4m3_to_float_pa(k_fp8_ptr[
-                                k_nvfp4_base + b * fp4_k_blk_stride]);
-                    }
+                    if (b < fp4_abs_k_blocks)
+                        k_nv_raw[b] = k_fp8_ptr[k_nvfp4_base + b * fp4_k_blk_stride];
+                }
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
+                    if (b < fp4_abs_k_blocks)
+                        k_block_scales[token_depth][b] = fp8_e4m3_to_float_pa(k_nv_raw[b]);
                 }
                 token_k_scale = 1.0f;
             } else if (fp4_num_k_blocks < 0) {
@@ -384,13 +387,16 @@ _paged_attention_kernel(const int* block_table_seq,
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
                 const int64_t k_scale_base =
                     fp4_k_head_base + physical_token_idx;
+                uint8_t k_raw[FP4_MAX_K_BLOCKS];
                 #pragma unroll
                 for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
-                    if (b < fp4_abs_k_blocks) {
-                        k_block_scales[token_depth][b] =
-                            fp8_e4m3_to_float_pa(k_fp8_ptr[
-                                k_scale_base + b * fp4_k_blk_stride]);
-                    }
+                    if (b < fp4_abs_k_blocks)
+                        k_raw[b] = k_fp8_ptr[k_scale_base + b * fp4_k_blk_stride];
+                }
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
+                    if (b < fp4_abs_k_blocks)
+                        k_block_scales[token_depth][b] = fp8_e4m3_to_float_pa(k_raw[b]);
                 }
                 token_k_scale = 1.0f;
             } else {
@@ -430,13 +436,16 @@ _paged_attention_kernel(const int* block_table_seq,
                     fp4_v_head_base + physical_token_idx;
                 const int v_smem_base =
                     klocal_token_idx * fp4_abs_v_blocks;
+                uint8_t v_nv_raw[FP4_MAX_V_BLOCKS];
                 #pragma unroll
                 for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
-                    if (b < fp4_abs_v_blocks) {
-                        float vbs = fp8_e4m3_to_float_pa(v_fp8_ptr[
-                            v_nvfp4_base + b * fp4_v_blk_stride]);
-                        v_blk_scale_smem[v_smem_base + b] = vbs;
-                    }
+                    if (b < fp4_abs_v_blocks)
+                        v_nv_raw[b] = v_fp8_ptr[v_nvfp4_base + b * fp4_v_blk_stride];
+                }
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
+                    if (b < fp4_abs_v_blocks)
+                        v_blk_scale_smem[v_smem_base + b] = fp8_e4m3_to_float_pa(v_nv_raw[b]);
                 }
                 token_v_scale = 1.0f;
             } else if (fp4_num_v_blocks < 0) {
@@ -463,13 +472,16 @@ _paged_attention_kernel(const int* block_table_seq,
                     fp4_v_head_base + physical_token_idx;
                 const int smem_base =
                     klocal_token_idx * fp4_abs_v_blocks;
+                uint8_t v_raw[FP4_MAX_V_BLOCKS];
                 #pragma unroll
                 for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
-                    if (b < fp4_abs_v_blocks) {
-                        float vbs = fp8_e4m3_to_float_pa(v_fp8_ptr[
-                            v_scale_base + b * fp4_v_blk_stride]);
-                        v_blk_scale_smem[smem_base + b] = vbs;
-                    }
+                    if (b < fp4_abs_v_blocks)
+                        v_raw[b] = v_fp8_ptr[v_scale_base + b * fp4_v_blk_stride];
+                }
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
+                    if (b < fp4_abs_v_blocks)
+                        v_blk_scale_smem[smem_base + b] = fp8_e4m3_to_float_pa(v_raw[b]);
                 }
                 token_v_scale = 1.0f;
             } else {
@@ -491,24 +503,14 @@ _paged_attention_kernel(const int* block_table_seq,
                 
                 if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    // FP4 packed: 2 FP4 values per byte
                     const int byte_offset = head_elem / 2;
                     const int offset1 = byte_offset / KX;
                     const int offset2 = byte_offset % KX;
                     const cache_t* k_fetch_ptr = k_ptr3 + offset1 * KX + offset2;
-                    
-                    // Load 8 bytes and duplicate to both halves for qkratio iterations
-                    union {
-                        uint64_t u64;
-                        _B16x8 b16x8;
-                    } loaded_data;
-                    loaded_data.u64 = *reinterpret_cast<const uint64_t*>(k_fetch_ptr);
-                    _B8x16 temp;
-                    temp.xy[0] = *reinterpret_cast<_B8x8*>(&loaded_data.u64);
-                    temp.xy[1] = temp.xy[0];
-                    loaded_data.b16x8 = *reinterpret_cast<_B16x8*>(&temp);
-                    
-                    Klocal[head_loop][token_depth][qkhe_depth] = loaded_data.b16x8;
+
+                    *reinterpret_cast<uint64_t*>(
+                        &Klocal[head_loop][token_depth][qkhe_depth]) =
+                        *reinterpret_cast<const uint64_t*>(k_fetch_ptr);
                 }
                 else
                 {
@@ -597,7 +599,6 @@ _paged_attention_kernel(const int* block_table_seq,
                 
                 if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    // FP4 packed: 2 FP4 values per byte
                     const int vhead_elem_fp4 =
                         vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
                     const int vhead_elem = vhead_elem_fp4 / 2;
@@ -607,18 +608,9 @@ _paged_attention_kernel(const int* block_table_seq,
                         static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
                     const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
 
-                    // Load 8 bytes for FP4
-                    union {
-                        uint64_t u64;
-                        _B16x8 b16x8;
-                    } loaded_data;
-                    loaded_data.u64 = *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
-                    _B8x16 temp;
-                    temp.xy[0] = *reinterpret_cast<_B8x8*>(&loaded_data.u64);
-                    temp.xy[1] = temp.xy[0];
-                    loaded_data.b16x8 = *reinterpret_cast<_B16x8*>(&temp);
-                    
-                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] = loaded_data.b16x8;
+                    *reinterpret_cast<uint64_t*>(
+                        &Vlocal[vtoken_depth][vhe_depth][vblock_depth]) =
+                        *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
                 }
                 else
                 {
@@ -700,11 +692,9 @@ _paged_attention_kernel(const int* block_table_seq,
                         }
                         else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                         {
-                            auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
-                            _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
+                            _B8x8 Ktmp_fp4 = *reinterpret_cast<const _B8x8*>(
+                                &Klocal[head_loop][token_depth][qkhe_depth]);
 
-                            // Hoist block index outside qkratio — k_blk is
-                            // constant for all elements in a qkhe_depth.
                             int k_blk = 0;
                             float k_blk_scale = 1.0f;
                             if (fp4_abs_k_blocks > 1) {
@@ -720,13 +710,11 @@ _paged_attention_kernel(const int* block_table_seq,
                             #pragma unroll
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
-                                _B8x8 Ktmp8x8_fp4 = Ktmp8x16.xy[qkratio];
-
                                 _B16x8 Klocaltmp = (fp4_abs_k_blocks > 1)
                                     ? convert_and_scale_b8x8_fp4<scalar_t>(
-                                        Ktmp8x8_fp4, qkratio * 4, k_blk_scale)
+                                        Ktmp_fp4, qkratio * 4, k_blk_scale)
                                     : convert_b8x8_fp4<scalar_t>(
-                                        Ktmp8x8_fp4, qkratio * 4);
+                                        Ktmp_fp4, qkratio * 4);
 
                                 if (fp4_abs_k_blocks > 1) {
                                     scalar_t* kvals =
@@ -748,9 +736,9 @@ _paged_attention_kernel(const int* block_table_seq,
                                             const int byte_idx = bm_in_chunk / 2;
                                             const int nibble_in_byte =
                                                 bm_in_chunk % 2;
-                                            uint8_t* packed =
-                                                reinterpret_cast<uint8_t*>(
-                                                    &Ktmp8x8_fp4);
+                                            const uint8_t* packed =
+                                                reinterpret_cast<const uint8_t*>(
+                                                    &Ktmp_fp4);
                                             uint8_t raw_byte =
                                                 packed[qkratio * 4 + byte_idx];
                                             uint8_t nibble = (nibble_in_byte == 0)
@@ -1148,10 +1136,18 @@ _paged_attention_kernel(const int* block_table_seq,
                 const int vlds_col_idx = laneid % n_thread_per_block;
                 const int vlocal_token_idx =
                     vblock_depth * k_thread_per_block + threadIdx.x / n_thread_per_block;
-                *reinterpret_cast<_B16x8*>(vlds_ptr +
-                                           (/*row=*/vlocal_token_idx * n_thread_per_block +
-                                            /*col=*/vlds_col_idx) *
-                                               16) = Vlocal[vtoken_depth][vhe_depth][vblock_depth];
+                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
+                    *reinterpret_cast<uint64_t*>(
+                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
+                                    vlds_col_idx) * 16) =
+                        *reinterpret_cast<const uint64_t*>(
+                            &Vlocal[vtoken_depth][vhe_depth][vblock_depth]);
+                } else {
+                    *reinterpret_cast<_B16x8*>(
+                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
+                                    vlds_col_idx) * 16) =
+                        Vlocal[vtoken_depth][vhe_depth][vblock_depth];
+                }
             }
             __syncthreads();
 
@@ -1168,43 +1164,32 @@ _paged_attention_kernel(const int* block_table_seq,
 
                 if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    // FP4: each cache byte packs 2 head elements.
-                    // Extract the individual nibble for THIS lane's
-                    // head element from each of the 16 tokens, then
-                    // repack consecutive token-pairs into bytes so
-                    // convert_b8x8_fp4 produces bf16 ordered by token.
                     const int fp4_byte_idx   = vlds_elem_idx / 2;
-                    const int fp4_nibble_sel = vlds_elem_idx & 1;
+                    const int fp4_shift      = (vlds_elem_idx & 1) * 4;
+                    const int lds_row_stride = n_thread_per_block * 16;
+                    const cache_t* lds_base  = reinterpret_cast<const cache_t*>(
+                        vlds_ptr + vlocal_token_idx * lds_row_stride
+                        + vlds_col_idx * 16);
 
-                    uint8_t nibbles[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    union { _B16x8 b16x8; uint8_t bytes[16]; } pk;
+                    pk.b16x8 = _B16x8{};
+
+                    #pragma unroll
+                    for(int p = 0; p < 4; p++)
                     {
-                        const cache_t* fe = reinterpret_cast<const cache_t*>(
-                            vlds_ptr +
-                            (/*row=*/(vlocal_token_idx + d2) *
-                                 n_thread_per_block +
-                             /*col=*/vlds_col_idx) * 16);
-                        uint8_t packed = fe[fp4_byte_idx];
-                        nibbles[d2] = fp4_nibble_sel
-                            ? ((packed >> 4) & 0xF)
-                            : (packed & 0xF);
+                        uint8_t n0 = (lds_base[(2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        pk.bytes[p] = n0 | (n1 << 4);
+                    }
+                    #pragma unroll
+                    for(int p = 0; p < 4; p++)
+                    {
+                        uint8_t n0 = (lds_base[(8 + 2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(8 + 2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        pk.bytes[12 + p] = n0 | (n1 << 4);
                     }
 
-                    // Repack: low nibble = even token, high = odd.
-                    // j=0 reads bytes[0..3]  (offset 0 in 1st _B8x8)
-                    // j=1 reads bytes[12..15] (offset 4 in 2nd _B8x8)
-                    cache_t repacked[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
-                        repacked[d2] = 0;
-                    for(int p = 0; p < 4; p++)
-                        repacked[p] = nibbles[2*p]
-                                    | (nibbles[2*p + 1] << 4);
-                    for(int p = 0; p < 4; p++)
-                        repacked[12 + p] = nibbles[8 + 2*p]
-                                         | (nibbles[8 + 2*p + 1] << 4);
-
-                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
-                        *reinterpret_cast<const _B16x8*>(repacked);
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = pk.b16x8;
                 }
                 else
                 {
@@ -2731,10 +2716,18 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 const int vlds_col_idx = laneid % n_thread_per_block;
                 const int vlocal_token_idx =
                     vblock_depth * k_thread_per_block + threadIdx.x / n_thread_per_block;
-                *reinterpret_cast<_B16x8*>(vlds_ptr +
-                                           (/*row=*/vlocal_token_idx * n_thread_per_block +
-                                            /*col=*/vlds_col_idx) *
-                                               16) = Vlocal[vtoken_depth][vhe_depth][vblock_depth];
+                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
+                    *reinterpret_cast<uint64_t*>(
+                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
+                                    vlds_col_idx) * 16) =
+                        *reinterpret_cast<const uint64_t*>(
+                            &Vlocal[vtoken_depth][vhe_depth][vblock_depth]);
+                } else {
+                    *reinterpret_cast<_B16x8*>(
+                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
+                                    vlds_col_idx) * 16) =
+                        Vlocal[vtoken_depth][vhe_depth][vblock_depth];
+                }
             }
             __syncthreads();
 
