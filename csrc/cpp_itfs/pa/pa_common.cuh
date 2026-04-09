@@ -347,7 +347,8 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input)
 // FP4 dequant: 8 bytes packed -> 8 BF16/FP16
 // byte_offset: 0 or 4 to select which half to process
 template <typename T>
-__device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input, int byte_offset = 0)
+__device__ __forceinline__ _B16x8 convert_b8x8_fp4(
+    const _B8x8 input, int byte_offset = 0)
 {
 #if defined(__gfx950__)
     union
@@ -363,6 +364,7 @@ __device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input, int byte_o
     {
         using bf16x2_raw_t = __bf16 __attribute__((ext_vector_type(2)));
 
+        #pragma unroll
         for (int i = 0; i < 4; i++) {
             uint8_t packed_byte = tmp.bytes[byte_offset + i];
             bf16x2_raw_t bf_pair = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed_byte, 1.0f, 0);
@@ -378,6 +380,7 @@ __device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input, int byte_o
     {
         using fp16x2_raw_t = _Float16 __attribute__((ext_vector_type(2)));
 
+        #pragma unroll
         for (int i = 0; i < 4; i++) {
             uint8_t packed_byte = tmp.bytes[byte_offset + i];
             fp16x2_raw_t fp_pair = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed_byte, 1.0f, 0);

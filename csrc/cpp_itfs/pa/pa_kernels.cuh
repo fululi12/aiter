@@ -666,45 +666,60 @@ _paged_attention_kernel(const int* block_table_seq,
                         }
                         else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                         {
-                            // FP4 KV cache: convert K from FP4 to BF16, use BF16 MFMA
                             auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
                             _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
+
+                            // Hoist block index outside qkratio — k_blk is
+                            // constant for all elements in a qkhe_depth.
+                            int k_blk = 0;
+                            float k_blk_scale = 1.0f;
+                            if (fp4_abs_k_blocks > 1) {
+                                const int head_elem =
+                                    row_head_elem
+                                    + qkhe_depth * QKHE_PER_FETCH
+                                    + head_loop * HEAD_SIZE_PER_LOOP;
+                                k_blk = head_elem / fp4_k_block_size;
+                                k_blk_scale =
+                                    k_block_scales[token_depth][k_blk];
+                            }
+
+                            #pragma unroll
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
                                 _B8x8 Ktmp8x8_fp4 = Ktmp8x16.xy[qkratio];
-                                
-                                // Convert FP4: qkratio*4 is byte offset
-                                _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8_fp4, qkratio * 4);
 
-                                // Per-block K scale pre-multiply
-                                {
-                                    if (fp4_abs_k_blocks > 1) {
-                                    const int head_elem =
-                                        row_head_elem
-                                        + qkhe_depth * QKHE_PER_FETCH
-                                        + head_loop * HEAD_SIZE_PER_LOOP;
-                                    const int k_blk = head_elem / fp4_k_block_size;
-                                    const float k_blk_scale =
-                                        k_block_scales[token_depth][k_blk];
+                                _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(
+                                    Ktmp8x8_fp4, qkratio * 4);
+
+                                if (fp4_abs_k_blocks > 1) {
                                     scalar_t* kvals =
                                         reinterpret_cast<scalar_t*>(&Klocaltmp);
+                                    #pragma unroll
                                     for (int e = 0; e < 8; e++) {
-                                        float f = to_float<scalar_t>(kvals[e])
-                                                  * k_blk_scale;
-                                        kvals[e] = from_float<scalar_t>(f);
+                                        kvals[e] = from_float<scalar_t>(
+                                            to_float<scalar_t>(kvals[e])
+                                            * k_blk_scale);
                                     }
 
                                     if (fp4_k_is_amxfp4) {
                                         const int bm_pos =
                                             static_cast<int>(k_bm_idx_local[token_depth][k_blk]);
+                                        const int head_elem =
+                                            row_head_elem
+                                            + qkhe_depth * QKHE_PER_FETCH
+                                            + head_loop * HEAD_SIZE_PER_LOOP;
                                         const int chunk_start =
-                                            (head_elem + qkratio * 8) % fp4_k_block_size;
-                                        const int bm_in_chunk = bm_pos - chunk_start;
+                                            (head_elem + qkratio * 8)
+                                            % fp4_k_block_size;
+                                        const int bm_in_chunk =
+                                            bm_pos - chunk_start;
                                         if (bm_in_chunk >= 0 && bm_in_chunk < 8) {
                                             const int byte_idx = bm_in_chunk / 2;
-                                            const int nibble_in_byte = bm_in_chunk % 2;
+                                            const int nibble_in_byte =
+                                                bm_in_chunk % 2;
                                             uint8_t* packed =
-                                                reinterpret_cast<uint8_t*>(&Ktmp8x8_fp4);
+                                                reinterpret_cast<uint8_t*>(
+                                                    &Ktmp8x8_fp4);
                                             uint8_t raw_byte =
                                                 packed[qkratio * 4 + byte_idx];
                                             uint8_t nibble = (nibble_in_byte == 0)
@@ -714,12 +729,10 @@ _paged_attention_kernel(const int* block_table_seq,
                                                 amxfp4_bm_lut_pa[nibble & 0x7];
                                             float sign_f =
                                                 (nibble & 0x8) ? -1.0f : 1.0f;
-                                            float corrected =
-                                                sign_f * bm_mag * k_blk_scale;
                                             kvals[bm_in_chunk] =
-                                                from_float<scalar_t>(corrected);
+                                                from_float<scalar_t>(
+                                                    sign_f * bm_mag * k_blk_scale);
                                         }
-                                    }
                                     }
                                 }
 
@@ -1235,102 +1248,111 @@ _paged_attention_kernel(const int* block_table_seq,
                     else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                     {
                         constexpr int EFFECTIVE_VTLANELOOP = VTLANELOOP * ELEMS16_ELEMS8_RATIO;
-                        
+
+                        // Hoist invariants that only depend on vhe_depth/warpid
+                        const int v_blk = (fp4_abs_v_blocks > 1)
+                            ? static_cast<int>((vhe_depth * NWARPS * 16 + warpid * 16)
+                              / fp4_v_block_size)
+                            : 0;
+                        const int v_bm_offset_in_blk = fp4_v_is_amxfp4
+                            ? static_cast<int>((vhe_depth * NWARPS * 16 + warpid * 16)
+                              % fp4_v_block_size)
+                            : 0;
+
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
                             _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
                             _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
+
+                            // Hoist vlocal_tok outside j loop
+                            const int vlocal_tok =
+                                rowid * VTOKENS_PER_LANE
+                                + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+
+                            #pragma unroll
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
                                 _B8x8 Vtmp8x8 = Vtmp8x16.xy[j];
-                                _B16x8 Vlocaltmp;
-
-                                Vlocaltmp = convert_b8x8_fp4<scalar_t>(
+                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(
                                     Vtmp8x8, j * 4);
 
-                                // V per-block dequant
-                                {
-                                    if (fp4_abs_v_blocks > 1) {
-                                    const int v_blk =
-                                        (vhe_depth * NWARPS * 16 + warpid * 16) / fp4_v_block_size;
-                                    const int vlocal_tok =
-                                        rowid * VTOKENS_PER_LANE
-                                        + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                                    const int v_bm_offset_in_blk =
-                                        (vhe_depth * NWARPS * 16 + warpid * 16) % fp4_v_block_size;
+                                if (fp4_abs_v_blocks > 1) {
+                                    const int tp_base =
+                                        vtoken_depth * TOKENS_PER_WARP
+                                        + vlocal_tok + j * 8;
+
+                                    // Pre-fetch all 8 V scales from shared
+                                    // memory before the ALU multiply loop
+                                    // to improve instruction-level parallelism.
+                                    float vs[8];
+                                    #pragma unroll
+                                    for (int bi = 0; bi < 4; bi++) {
+                                        const int tp0 = tp_base + bi * 2;
+                                        vs[bi * 2] =
+                                            (tp0 < V_SCALE_SMEM_TOKENS)
+                                            ? v_blk_scale_smem[
+                                                tp0 * fp4_abs_v_blocks + v_blk]
+                                            : 0.0f;
+                                        vs[bi * 2 + 1] =
+                                            (tp0 + 1 < V_SCALE_SMEM_TOKENS)
+                                            ? v_blk_scale_smem[
+                                                (tp0 + 1) * fp4_abs_v_blocks + v_blk]
+                                            : 0.0f;
+                                    }
+
+                                    // Apply all scales in a tight ALU-only loop
                                     scalar_t* vvals =
                                         reinterpret_cast<scalar_t*>(&Vlocaltmp);
-                                    for (int bi = 0; bi < 4; bi++) {
-                                        const int tok_off_0 = j * 8 + bi * 2;
-                                        const int tok_off_1 = tok_off_0 + 1;
-                                        const int tp0 =
-                                            vtoken_depth * TOKENS_PER_WARP
-                                            + vlocal_tok + tok_off_0;
-                                        const int tp1 = tp0 + 1;
-                                        const float s0 =
-                                            (tp0 < V_SCALE_SMEM_TOKENS)
-                                            ? v_blk_scale_smem[tp0
-                                                * fp4_abs_v_blocks + v_blk]
-                                            : 0.0f;
-                                        const float s1 =
-                                            (tp1 < V_SCALE_SMEM_TOKENS)
-                                            ? v_blk_scale_smem[tp1
-                                                * fp4_abs_v_blocks + v_blk]
-                                            : 0.0f;
-                                        const int base = bi * 2;
-                                        vvals[base] = from_float<scalar_t>(
-                                            to_float<scalar_t>(vvals[base]) * s0);
-                                        vvals[base + 1] = from_float<scalar_t>(
-                                            to_float<scalar_t>(vvals[base + 1]) * s1);
+                                    #pragma unroll
+                                    for (int e = 0; e < 8; e++) {
+                                        vvals[e] = from_float<scalar_t>(
+                                            to_float<scalar_t>(vvals[e]) * vs[e]);
+                                    }
 
-                                        if (fp4_v_is_amxfp4) {
+                                    if (fp4_v_is_amxfp4) {
+                                        #pragma unroll
+                                        for (int bi = 0; bi < 4; bi++) {
+                                            const int tp0 = tp_base + bi * 2;
+                                            const int tp1 = tp0 + 1;
+                                            const int base = bi * 2;
                                             if (tp0 < V_SCALE_SMEM_TOKENS) {
                                                 const uint8_t bm0 =
                                                     v_bm_idx_smem[tp0
                                                         * fp4_abs_v_blocks + v_blk];
-                                                const int bm_in_warp0 =
-                                                    static_cast<int>(bm0)
-                                                    - v_bm_offset_in_blk;
-                                                if (bm_in_warp0 == lane16id) {
+                                                if (static_cast<int>(bm0)
+                                                    - v_bm_offset_in_blk == lane16id) {
                                                     uint8_t* pk =
                                                         reinterpret_cast<uint8_t*>(
                                                             &Vtmp8x8);
                                                     uint8_t nib =
                                                         pk[j * 4 + bi] & 0xF;
-                                                    float mag =
-                                                        amxfp4_bm_lut_pa[nib & 0x7];
-                                                    float sgn =
-                                                        (nib & 0x8) ? -1.0f : 1.0f;
                                                     vvals[base] =
                                                         from_float<scalar_t>(
-                                                            sgn * mag * s0);
+                                                            ((nib & 0x8) ? -1.0f : 1.0f)
+                                                            * amxfp4_bm_lut_pa[nib & 0x7]
+                                                            * vs[bi * 2]);
                                                 }
                                             }
                                             if (tp1 < V_SCALE_SMEM_TOKENS) {
                                                 const uint8_t bm1 =
                                                     v_bm_idx_smem[tp1
                                                         * fp4_abs_v_blocks + v_blk];
-                                                const int bm_in_warp1 =
-                                                    static_cast<int>(bm1)
-                                                    - v_bm_offset_in_blk;
-                                                if (bm_in_warp1 == lane16id) {
+                                                if (static_cast<int>(bm1)
+                                                    - v_bm_offset_in_blk == lane16id) {
                                                     uint8_t* pk =
                                                         reinterpret_cast<uint8_t*>(
                                                             &Vtmp8x8);
                                                     uint8_t nib =
                                                         (pk[j * 4 + bi] >> 4)
                                                         & 0xF;
-                                                    float mag =
-                                                        amxfp4_bm_lut_pa[nib & 0x7];
-                                                    float sgn =
-                                                        (nib & 0x8) ? -1.0f : 1.0f;
                                                     vvals[base + 1] =
                                                         from_float<scalar_t>(
-                                                            sgn * mag * s1);
+                                                            ((nib & 0x8) ? -1.0f : 1.0f)
+                                                            * amxfp4_bm_lut_pa[nib & 0x7]
+                                                            * vs[bi * 2 + 1]);
                                                 }
                                             }
                                         }
-                                    }
                                     }
                                 }
                                 
