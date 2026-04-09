@@ -402,6 +402,38 @@ __device__ __forceinline__ _B16x8 convert_b8x8_fp4(
 #endif
 }
 
+// FP4 dequant + uniform scale: converts 8 packed FP4 nibbles and
+// multiplies each result by the same scalar.
+// Wraps convert + scale into a single call so the compiler can
+// optimize across both phases when fully unrolled.
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_and_scale_b8x8_fp4(
+    const _B8x8 input, int byte_offset, float scale)
+{
+    _B16x8 ret = convert_b8x8_fp4<T>(input, byte_offset);
+    T* vals = reinterpret_cast<T*>(&ret);
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        vals[e] = from_float<T>(to_float<T>(vals[e]) * scale);
+    }
+    return ret;
+}
+
+// FP4 dequant + per-element scale: converts 8 packed FP4 nibbles and
+// multiplies each by its corresponding scale[0..7].
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_and_scale_b8x8_fp4_per_elem(
+    const _B8x8 input, int byte_offset, const float scales[8])
+{
+    _B16x8 ret = convert_b8x8_fp4<T>(input, byte_offset);
+    T* vals = reinterpret_cast<T*>(&ret);
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        vals[e] = from_float<T>(to_float<T>(vals[e]) * scales[e]);
+    }
+    return ret;
+}
+
 // FP4 dequant with per-byte scales: each of the 4 bytes gets its own
 // dequantization scale baked into the HW conversion intrinsic.
 // Used for per-block V scaling where each byte is from a different token.

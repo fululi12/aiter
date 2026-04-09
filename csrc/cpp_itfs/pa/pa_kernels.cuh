@@ -332,51 +332,65 @@ _paged_attention_kernel(const int* block_table_seq,
             } else if (fp4_num_k_blocks <= -AMXFP4_SIGNAL_OFFSET) {
                 const uint8_t* k_data_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
-                for (int b = 0; b < fp4_abs_k_blocks; b++) {
-                    const int64_t scale_idx = fp4_k_head_base
-                                              + b * fp4_k_blk_stride
-                                              + physical_token_idx;
-                    uint8_t e8m0 = k_data_ptr[scale_idx];
-                    k_block_scales[token_depth][b] =
-                        exp2f(static_cast<float>(e8m0) - 127.0f);
-                    const int64_t bm_idx_offset = fp4_k_head_base
-                                                  + (fp4_abs_k_blocks + b) * fp4_k_blk_stride
-                                                  + physical_token_idx;
-                    k_bm_idx_local[token_depth][b] = k_data_ptr[bm_idx_offset];
+                const int64_t k_amx_base =
+                    fp4_k_head_base + physical_token_idx;
+                const int64_t k_amx_bm_base =
+                    fp4_k_head_base
+                    + fp4_abs_k_blocks * fp4_k_blk_stride
+                    + physical_token_idx;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
+                    if (b < fp4_abs_k_blocks) {
+                        uint8_t e8m0 = k_data_ptr[
+                            k_amx_base + b * fp4_k_blk_stride];
+                        k_block_scales[token_depth][b] =
+                            exp2f(static_cast<float>(e8m0) - 127.0f);
+                        k_bm_idx_local[token_depth][b] = k_data_ptr[
+                            k_amx_bm_base + b * fp4_k_blk_stride];
+                    }
                 }
                 token_k_scale = 1.0f;
             } else if (fp4_num_k_blocks <= -NVFP4_SIGNAL_OFFSET) {
                 const uint8_t* k_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
-                for (int b = 0; b < fp4_abs_k_blocks; b++) {
-                    const int64_t scale_idx = fp4_k_head_base
-                                              + b * fp4_k_blk_stride
-                                              + physical_token_idx;
-                    uint8_t fp8_val = k_fp8_ptr[scale_idx];
-                    k_block_scales[token_depth][b] = fp8_e4m3_to_float_pa(fp8_val);
+                const int64_t k_nvfp4_base =
+                    fp4_k_head_base + physical_token_idx;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
+                    if (b < fp4_abs_k_blocks) {
+                        k_block_scales[token_depth][b] =
+                            fp8_e4m3_to_float_pa(k_fp8_ptr[
+                                k_nvfp4_base + b * fp4_k_blk_stride]);
+                    }
                 }
                 token_k_scale = 1.0f;
             } else if (fp4_num_k_blocks < 0) {
                 const uint8_t* k_e8m0_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
-                for (int b = 0; b < fp4_abs_k_blocks; b++) {
-                    const int64_t scale_idx = fp4_k_head_base
-                                              + b * fp4_k_blk_stride
-                                              + physical_token_idx;
-                    uint8_t e8m0 = k_e8m0_ptr[scale_idx];
-                    k_block_scales[token_depth][b] =
-                        exp2f(static_cast<float>(e8m0) - 127.0f);
+                const int64_t k_mxfp4_base =
+                    fp4_k_head_base + physical_token_idx;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
+                    if (b < fp4_abs_k_blocks) {
+                        uint8_t e8m0 = k_e8m0_ptr[
+                            k_mxfp4_base + b * fp4_k_blk_stride];
+                        k_block_scales[token_depth][b] =
+                            exp2f(static_cast<float>(e8m0) - 127.0f);
+                    }
                 }
                 token_k_scale = 1.0f;
             } else if (fp4_abs_k_blocks > 1) {
                 const uint8_t* k_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
-                for (int b = 0; b < fp4_abs_k_blocks; b++) {
-                    const int64_t scale_idx = fp4_k_head_base
-                                              + b * fp4_k_blk_stride
-                                              + physical_token_idx;
-                    k_block_scales[token_depth][b] =
-                        fp8_e4m3_to_float_pa(k_fp8_ptr[scale_idx]);
+                const int64_t k_scale_base =
+                    fp4_k_head_base + physical_token_idx;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
+                    if (b < fp4_abs_k_blocks) {
+                        k_block_scales[token_depth][b] =
+                            fp8_e4m3_to_float_pa(k_fp8_ptr[
+                                k_scale_base + b * fp4_k_blk_stride]);
+                    }
                 }
                 token_k_scale = 1.0f;
             } else {
@@ -389,53 +403,73 @@ _paged_attention_kernel(const int* block_table_seq,
             if (fp4_num_v_blocks <= -AMXFP4_SIGNAL_OFFSET) {
                 const uint8_t* v_data_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
-                for (int b = 0; b < fp4_abs_v_blocks; b++) {
-                    const int64_t v_scale_idx = fp4_v_head_base
-                                                + b * fp4_v_blk_stride
-                                                + physical_token_idx;
-                    uint8_t e8m0 = v_data_ptr[v_scale_idx];
-                    float vbs = exp2f(static_cast<float>(e8m0) - 127.0f);
-                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
-                    const int64_t bm_idx_offset = fp4_v_head_base
-                                                  + (fp4_abs_v_blocks + b) * fp4_v_blk_stride
-                                                  + physical_token_idx;
-                    v_bm_idx_smem[klocal_token_idx * fp4_abs_v_blocks + b] =
-                        v_data_ptr[bm_idx_offset];
+                const int64_t v_amx_base =
+                    fp4_v_head_base + physical_token_idx;
+                const int64_t v_amx_bm_base =
+                    fp4_v_head_base
+                    + fp4_abs_v_blocks * fp4_v_blk_stride
+                    + physical_token_idx;
+                const int v_amx_smem_base =
+                    klocal_token_idx * fp4_abs_v_blocks;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
+                    if (b < fp4_abs_v_blocks) {
+                        uint8_t e8m0 = v_data_ptr[
+                            v_amx_base + b * fp4_v_blk_stride];
+                        v_blk_scale_smem[v_amx_smem_base + b] =
+                            exp2f(static_cast<float>(e8m0) - 127.0f);
+                        v_bm_idx_smem[v_amx_smem_base + b] =
+                            v_data_ptr[v_amx_bm_base + b * fp4_v_blk_stride];
+                    }
                 }
                 token_v_scale = 1.0f;
             } else if (fp4_num_v_blocks <= -NVFP4_SIGNAL_OFFSET) {
                 const uint8_t* v_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
-                for (int b = 0; b < fp4_abs_v_blocks; b++) {
-                    const int64_t v_scale_idx = fp4_v_head_base
-                                                + b * fp4_v_blk_stride
-                                                + physical_token_idx;
-                    uint8_t fp8_val = v_fp8_ptr[v_scale_idx];
-                    float vbs = fp8_e4m3_to_float_pa(fp8_val);
-                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
+                const int64_t v_nvfp4_base =
+                    fp4_v_head_base + physical_token_idx;
+                const int v_smem_base =
+                    klocal_token_idx * fp4_abs_v_blocks;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
+                    if (b < fp4_abs_v_blocks) {
+                        float vbs = fp8_e4m3_to_float_pa(v_fp8_ptr[
+                            v_nvfp4_base + b * fp4_v_blk_stride]);
+                        v_blk_scale_smem[v_smem_base + b] = vbs;
+                    }
                 }
                 token_v_scale = 1.0f;
             } else if (fp4_num_v_blocks < 0) {
                 const uint8_t* v_e8m0_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
-                for (int b = 0; b < fp4_abs_v_blocks; b++) {
-                    const int64_t v_scale_idx = fp4_v_head_base
-                                                + b * fp4_v_blk_stride
-                                                + physical_token_idx;
-                    uint8_t e8m0 = v_e8m0_ptr[v_scale_idx];
-                    float vbs = exp2f(static_cast<float>(e8m0) - 127.0f);
-                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
+                const int64_t v_mxfp4_base =
+                    fp4_v_head_base + physical_token_idx;
+                const int v_mxfp4_smem_base =
+                    klocal_token_idx * fp4_abs_v_blocks;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
+                    if (b < fp4_abs_v_blocks) {
+                        uint8_t e8m0 = v_e8m0_ptr[
+                            v_mxfp4_base + b * fp4_v_blk_stride];
+                        v_blk_scale_smem[v_mxfp4_smem_base + b] =
+                            exp2f(static_cast<float>(e8m0) - 127.0f);
+                    }
                 }
                 token_v_scale = 1.0f;
             } else if (fp4_abs_v_blocks > 1) {
                 const uint8_t* v_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
-                for (int b = 0; b < fp4_abs_v_blocks; b++) {
-                    const int64_t v_scale_idx = fp4_v_head_base
-                                                + b * fp4_v_blk_stride
-                                                + physical_token_idx;
-                    float vbs = fp8_e4m3_to_float_pa(v_fp8_ptr[v_scale_idx]);
-                    v_blk_scale_smem[klocal_token_idx * fp4_abs_v_blocks + b] = vbs;
+                const int64_t v_scale_base =
+                    fp4_v_head_base + physical_token_idx;
+                const int smem_base =
+                    klocal_token_idx * fp4_abs_v_blocks;
+                #pragma unroll
+                for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
+                    if (b < fp4_abs_v_blocks) {
+                        float vbs = fp8_e4m3_to_float_pa(v_fp8_ptr[
+                            v_scale_base + b * fp4_v_blk_stride]);
+                        v_blk_scale_smem[smem_base + b] = vbs;
+                    }
                 }
                 token_v_scale = 1.0f;
             } else {
@@ -688,18 +722,15 @@ _paged_attention_kernel(const int* block_table_seq,
                             {
                                 _B8x8 Ktmp8x8_fp4 = Ktmp8x16.xy[qkratio];
 
-                                _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(
-                                    Ktmp8x8_fp4, qkratio * 4);
+                                _B16x8 Klocaltmp = (fp4_abs_k_blocks > 1)
+                                    ? convert_and_scale_b8x8_fp4<scalar_t>(
+                                        Ktmp8x8_fp4, qkratio * 4, k_blk_scale)
+                                    : convert_b8x8_fp4<scalar_t>(
+                                        Ktmp8x8_fp4, qkratio * 4);
 
                                 if (fp4_abs_k_blocks > 1) {
                                     scalar_t* kvals =
                                         reinterpret_cast<scalar_t*>(&Klocaltmp);
-                                    #pragma unroll
-                                    for (int e = 0; e < 8; e++) {
-                                        kvals[e] = from_float<scalar_t>(
-                                            to_float<scalar_t>(kvals[e])
-                                            * k_blk_scale);
-                                    }
 
                                     if (fp4_k_is_amxfp4) {
                                         const int bm_pos =
@@ -1273,52 +1304,49 @@ _paged_attention_kernel(const int* block_table_seq,
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
                                 _B8x8 Vtmp8x8 = Vtmp8x16.xy[j];
-                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(
-                                    Vtmp8x8, j * 4);
+                                _B16x8 Vlocaltmp;
 
                                 if (fp4_abs_v_blocks > 1) {
                                     const int tp_base =
                                         vtoken_depth * TOKENS_PER_WARP
                                         + vlocal_tok + j * 8;
 
-                                    // Pre-fetch all 8 V scales from shared
-                                    // memory before the ALU multiply loop
-                                    // to improve instruction-level parallelism.
                                     float vs[8];
-                                    #pragma unroll
-                                    for (int bi = 0; bi < 4; bi++) {
-                                        const int tp0 = tp_base + bi * 2;
-                                        vs[bi * 2] =
-                                            (tp0 < V_SCALE_SMEM_TOKENS)
-                                            ? v_blk_scale_smem[
-                                                tp0 * fp4_abs_v_blocks + v_blk]
-                                            : 0.0f;
-                                        vs[bi * 2 + 1] =
-                                            (tp0 + 1 < V_SCALE_SMEM_TOKENS)
-                                            ? v_blk_scale_smem[
-                                                (tp0 + 1) * fp4_abs_v_blocks + v_blk]
-                                            : 0.0f;
+                                    int smem_idx =
+                                        tp_base * fp4_abs_v_blocks + v_blk;
+                                    const int smem_stride = fp4_abs_v_blocks;
+
+                                    if (tp_base + 7 < V_SCALE_SMEM_TOKENS) {
+                                        #pragma unroll
+                                        for (int e = 0; e < 8; e++) {
+                                            vs[e] = v_blk_scale_smem[smem_idx];
+                                            smem_idx += smem_stride;
+                                        }
+                                    } else {
+                                        #pragma unroll
+                                        for (int e = 0; e < 8; e++) {
+                                            vs[e] = (tp_base + e < V_SCALE_SMEM_TOKENS)
+                                                ? v_blk_scale_smem[smem_idx]
+                                                : 0.0f;
+                                            smem_idx += smem_stride;
+                                        }
                                     }
 
-                                    // Apply all scales in a tight ALU-only loop
+                                    Vlocaltmp = convert_and_scale_b8x8_fp4_per_elem<scalar_t>(
+                                        Vtmp8x8, j * 4, vs);
                                     scalar_t* vvals =
                                         reinterpret_cast<scalar_t*>(&Vlocaltmp);
-                                    #pragma unroll
-                                    for (int e = 0; e < 8; e++) {
-                                        vvals[e] = from_float<scalar_t>(
-                                            to_float<scalar_t>(vvals[e]) * vs[e]);
-                                    }
 
                                     if (fp4_v_is_amxfp4) {
+                                        int bm_smem_idx =
+                                            tp_base * fp4_abs_v_blocks + v_blk;
                                         #pragma unroll
                                         for (int bi = 0; bi < 4; bi++) {
                                             const int tp0 = tp_base + bi * 2;
-                                            const int tp1 = tp0 + 1;
                                             const int base = bi * 2;
                                             if (tp0 < V_SCALE_SMEM_TOKENS) {
                                                 const uint8_t bm0 =
-                                                    v_bm_idx_smem[tp0
-                                                        * fp4_abs_v_blocks + v_blk];
+                                                    v_bm_idx_smem[bm_smem_idx];
                                                 if (static_cast<int>(bm0)
                                                     - v_bm_offset_in_blk == lane16id) {
                                                     uint8_t* pk =
@@ -1330,13 +1358,13 @@ _paged_attention_kernel(const int* block_table_seq,
                                                         from_float<scalar_t>(
                                                             ((nib & 0x8) ? -1.0f : 1.0f)
                                                             * amxfp4_bm_lut_pa[nib & 0x7]
-                                                            * vs[bi * 2]);
+                                                            * vs[base]);
                                                 }
                                             }
-                                            if (tp1 < V_SCALE_SMEM_TOKENS) {
+                                            if (tp0 + 1 < V_SCALE_SMEM_TOKENS) {
                                                 const uint8_t bm1 =
-                                                    v_bm_idx_smem[tp1
-                                                        * fp4_abs_v_blocks + v_blk];
+                                                    v_bm_idx_smem[
+                                                        bm_smem_idx + smem_stride];
                                                 if (static_cast<int>(bm1)
                                                     - v_bm_offset_in_blk == lane16id) {
                                                     uint8_t* pk =
@@ -1349,11 +1377,15 @@ _paged_attention_kernel(const int* block_table_seq,
                                                         from_float<scalar_t>(
                                                             ((nib & 0x8) ? -1.0f : 1.0f)
                                                             * amxfp4_bm_lut_pa[nib & 0x7]
-                                                            * vs[bi * 2 + 1]);
+                                                            * vs[base + 1]);
                                                 }
                                             }
+                                            bm_smem_idx += smem_stride * 2;
                                         }
                                     }
+                                } else {
+                                    Vlocaltmp = convert_b8x8_fp4<scalar_t>(
+                                        Vtmp8x8, j * 4);
                                 }
                                 
                                 const int combined_vfetch = vfetch_depth * ELEMS16_ELEMS8_RATIO + j;
