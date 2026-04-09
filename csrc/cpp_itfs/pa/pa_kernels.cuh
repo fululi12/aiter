@@ -9,15 +9,12 @@
 // Normal:    2^(E-8) * (1 + M/8)  →  IEEE exp = E+119, mantissa = M<<20
 // Subnormal: 2^(-7) * (M/8) = M * 2^(-10) = M / 1024
 __inline__ __device__ float fp8_e4m3_to_float_pa(uint8_t x) {
-  if (x == 0) return 0.0f;
   const unsigned int exp_bits = (x >> 3) & 0xFu;
   const unsigned int mantissa = x & 0x7u;
-  if (exp_bits == 0) {
-    return static_cast<float>(mantissa) * (1.0f / 1024.0f);
-  }
-  union { unsigned int u; float f; } conv;
-  conv.u = ((exp_bits + 119u) << 23) | (mantissa << 20);
-  return conv.f;
+  float denorm_val = static_cast<float>(mantissa) * (1.0f / 1024.0f);
+  union { unsigned int u; float f; } normal;
+  normal.u = ((exp_bits + 119u) << 23) | (mantissa << 20);
+  return (exp_bits != 0) ? normal.f : denorm_val;
 }
 
 // Threshold to distinguish NVFP4 E4M3 signaling from MXFP4 E8M0.
@@ -386,12 +383,17 @@ _paged_attention_kernel(const int* block_table_seq,
                 const uint8_t* k_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(k_scale_ptr);
                 const int64_t k_scale_base =
-                    fp4_k_head_base + physical_token_idx;
+                    fp4_k_head_base + physical_token_idx * fp4_abs_k_blocks;
                 uint8_t k_raw[FP4_MAX_K_BLOCKS];
-                #pragma unroll
-                for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
-                    if (b < fp4_abs_k_blocks)
-                        k_raw[b] = k_fp8_ptr[k_scale_base + b * fp4_k_blk_stride];
+                if constexpr (FP4_MAX_K_BLOCKS == 4) {
+                    *reinterpret_cast<uint32_t*>(k_raw) =
+                        *reinterpret_cast<const uint32_t*>(k_fp8_ptr + k_scale_base);
+                } else {
+                    #pragma unroll
+                    for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
+                        if (b < fp4_abs_k_blocks)
+                            k_raw[b] = k_fp8_ptr[k_scale_base + b];
+                    }
                 }
                 #pragma unroll
                 for (int b = 0; b < FP4_MAX_K_BLOCKS; b++) {
@@ -469,14 +471,19 @@ _paged_attention_kernel(const int* block_table_seq,
                 const uint8_t* v_fp8_ptr =
                     reinterpret_cast<const uint8_t*>(v_scale_ptr);
                 const int64_t v_scale_base =
-                    fp4_v_head_base + physical_token_idx;
+                    fp4_v_head_base + physical_token_idx * fp4_abs_v_blocks;
                 const int smem_base =
                     klocal_token_idx * fp4_abs_v_blocks;
                 uint8_t v_raw[FP4_MAX_V_BLOCKS];
-                #pragma unroll
-                for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
-                    if (b < fp4_abs_v_blocks)
-                        v_raw[b] = v_fp8_ptr[v_scale_base + b * fp4_v_blk_stride];
+                if constexpr (FP4_MAX_V_BLOCKS == 4) {
+                    *reinterpret_cast<uint32_t*>(v_raw) =
+                        *reinterpret_cast<const uint32_t*>(v_fp8_ptr + v_scale_base);
+                } else {
+                    #pragma unroll
+                    for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
+                        if (b < fp4_abs_v_blocks)
+                            v_raw[b] = v_fp8_ptr[v_scale_base + b];
+                    }
                 }
                 #pragma unroll
                 for (int b = 0; b < FP4_MAX_V_BLOCKS; b++) {
@@ -1438,7 +1445,6 @@ _paged_attention_kernel(const int* block_table_seq,
                             }
                         }
                     }
-                    __syncthreads();
                 }
                 // apply post Softmax V mfma v_scale (scalar, for FP8 only;
                 // FP4 per-token V scale is pre-applied to softmax weights)
@@ -2745,34 +2751,31 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
                     const int fp4_byte_idx   = vlds_elem_idx / 2;
-                    const int fp4_nibble_sel = vlds_elem_idx & 1;
+                    const int fp4_shift      = (vlds_elem_idx & 1) * 4;
+                    const int lds_row_stride = n_thread_per_block * 16;
+                    const cache_t* lds_base  = reinterpret_cast<const cache_t*>(
+                        vlds_ptr + vlocal_token_idx * lds_row_stride
+                        + vlds_col_idx * 16);
 
-                    uint8_t nibbles[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    union { _B16x8 b16x8; uint8_t bytes[16]; } pk;
+                    pk.b16x8 = _B16x8{};
+
+                    #pragma unroll
+                    for(int p = 0; p < 4; p++)
                     {
-                        const cache_t* fe = reinterpret_cast<const cache_t*>(
-                            vlds_ptr +
-                            (/*row=*/(vlocal_token_idx + d2) *
-                                 n_thread_per_block +
-                             /*col=*/vlds_col_idx) * 16);
-                        uint8_t packed = fe[fp4_byte_idx];
-                        nibbles[d2] = fp4_nibble_sel
-                            ? ((packed >> 4) & 0xF)
-                            : (packed & 0xF);
+                        uint8_t n0 = (lds_base[(2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        pk.bytes[p] = n0 | (n1 << 4);
+                    }
+                    #pragma unroll
+                    for(int p = 0; p < 4; p++)
+                    {
+                        uint8_t n0 = (lds_base[(8 + 2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(8 + 2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        pk.bytes[12 + p] = n0 | (n1 << 4);
                     }
 
-                    cache_t repacked[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
-                        repacked[d2] = 0;
-                    for(int p = 0; p < 4; p++)
-                        repacked[p] = nibbles[2*p]
-                                    | (nibbles[2*p + 1] << 4);
-                    for(int p = 0; p < 4; p++)
-                        repacked[12 + p] = nibbles[8 + 2*p]
-                                         | (nibbles[8 + 2*p + 1] << 4);
-
-                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
-                        *reinterpret_cast<const _B16x8*>(repacked);
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = pk.b16x8;
                 }
                 else
                 {
@@ -2939,7 +2942,6 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                             }
                         }
                     }
-                    __syncthreads();
                 }
                 // apply post Softmax V mfma v_scale (scalar, for FP8 only;
                 // FP4 per-token V scale is pre-applied to softmax weights)
