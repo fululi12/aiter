@@ -484,3 +484,4 @@ __device__ __forceinline__ float warpReduceMax(float val) {
     }
     return val;
 }
+

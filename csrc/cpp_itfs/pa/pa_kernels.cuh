@@ -2,18 +2,22 @@
 
 #include "pa_common.cuh"
 
-// FP8 E4M3 FNUZ to float conversion for NVFP4 block scales.
+// FP8 E4M3 FNUZ to float conversion via IEEE 754 bit construction.
+// Avoids exp2f() transcendental (16-32 cycle SFU latency) by directly
+// assembling the float32 bit pattern from the FP8 exponent and mantissa.
 // E4M3 FNUZ: 1 sign + 4 exponent (bias=8) + 3 mantissa bits.
-// For quantization scales we only store positive values (sign=0).
+// Normal:    2^(E-8) * (1 + M/8)  →  IEEE exp = E+119, mantissa = M<<20
+// Subnormal: 2^(-7) * (M/8) = M * 2^(-10) = M / 1024
 __inline__ __device__ float fp8_e4m3_to_float_pa(uint8_t x) {
   if (x == 0) return 0.0f;
-  int exp_bits = (x >> 3) & 0xF;
-  int mantissa = x & 0x7;
+  const unsigned int exp_bits = (x >> 3) & 0xFu;
+  const unsigned int mantissa = x & 0x7u;
   if (exp_bits == 0) {
-    return exp2f(-7.0f) * (static_cast<float>(mantissa) / 8.0f);
+    return static_cast<float>(mantissa) * (1.0f / 1024.0f);
   }
-  return exp2f(static_cast<float>(exp_bits - 8))
-         * (1.0f + static_cast<float>(mantissa) / 8.0f);
+  union { unsigned int u; float f; } conv;
+  conv.u = ((exp_bits + 119u) << 23) | (mantissa << 20);
+  return conv.f;
 }
 
 // Threshold to distinguish NVFP4 E4M3 signaling from MXFP4 E8M0.
@@ -246,10 +250,13 @@ _paged_attention_kernel(const int* block_table_seq,
 
 
     // Per-block K/V scales: block size is determined dynamically from
-    // HEAD_SIZE / fp4_abs_blocks so that both the default mode (block-64)
+    // HEAD_SIZE / fp4_abs_blocks so that both the default mode (block-32)
     // and legacy modes (MXFP4/NVFP4/AMXFP4, block-32) work correctly.
-    constexpr int FP4_MAX_K_BLOCKS = 16;  // head_size up to 512
-    constexpr int FP4_MAX_V_BLOCKS = 8;
+    // Sized to HEAD_SIZE/32 (minimum quant block) to minimize register
+    // pressure and shared memory usage; saves ~60 VGPRs for HEAD_SIZE=128.
+    constexpr int FP4_QUANT_BLK_MIN = 32;
+    constexpr int FP4_MAX_K_BLOCKS = DIVIDE_ROUND_UP(HEAD_SIZE, FP4_QUANT_BLK_MIN);
+    constexpr int FP4_MAX_V_BLOCKS = FP4_MAX_K_BLOCKS;
     float k_block_scales[TLOOP][FP4_MAX_K_BLOCKS];
     uint8_t k_bm_idx_local[TLOOP][FP4_MAX_K_BLOCKS];
     float v_token_scales[TLOOP];
@@ -669,8 +676,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                 // Convert FP4: qkratio*4 is byte offset
                                 _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8_fp4, qkratio * 4);
 
-                                // Per-block K scale pre-multiply: uses hoisted
-                                // fp4_abs_k_blocks / fp4_k_is_amxfp4.
+                                // Per-block K scale pre-multiply
                                 {
                                     if (fp4_abs_k_blocks > 1) {
                                     const int head_elem =
@@ -783,7 +789,28 @@ _paged_attention_kernel(const int* block_table_seq,
     }
 
 
-    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+    {
+        // For FP4 multi-block mode, k_token_scales are always 1.0 (scales
+        // are applied per-block inside the MFMA loop).  Skip the
+        // redundant multiply.
+        if (fp4_abs_k_blocks <= 1) {
+            for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+            {
+                for(int mtp = 0; mtp < mtp_loop; mtp++)
+                {
+                    for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+                    {
+                        for(int i = 0; i < 4; i++)
+                        {
+                            d_out[gqa_ratio_loop][mtp][token_depth][i] *= k_token_scales[token_depth];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
         {
@@ -987,7 +1014,12 @@ _paged_attention_kernel(const int* block_table_seq,
                     d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
                     if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                     {
-                        d_out[gqa_ratio_loop][mtp][token_depth] *= v_token_scales[token_depth];
+                        // For FP4 multi-block mode, v_token_scales are
+                        // always 1.0 (per-block V scales are applied in
+                        // the V MFMA loop).  Skip the redundant multiply.
+                        if (fp4_abs_v_blocks <= 1) {
+                            d_out[gqa_ratio_loop][mtp][token_depth] *= v_token_scales[token_depth];
+                        }
                     }
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
@@ -1216,8 +1248,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                 Vlocaltmp = convert_b8x8_fp4<scalar_t>(
                                     Vtmp8x8, j * 4);
 
-                                // V per-block dequant: uses hoisted
-                                // fp4_abs_v_blocks / fp4_v_is_amxfp4.
+                                // V per-block dequant
                                 {
                                     if (fp4_abs_v_blocks > 1) {
                                     const int v_blk =
