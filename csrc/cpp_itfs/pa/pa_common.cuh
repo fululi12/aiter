@@ -83,6 +83,15 @@ __device__ __forceinline__ _B16x8 load_ntmprl_16Byte(const _B16x8* addr)
     return *reinterpret_cast<_B16x8*>(&res);
 }
 
+__device__ __forceinline__ uint64_t load_ntmprl_8Byte(const void* addr)
+{
+    const float* fa = reinterpret_cast<const float*>(addr);
+    union { uint64_t u64; float f[2]; } u;
+    u.f[0] = loadnt(fa);
+    u.f[1] = loadnt(fa + 1);
+    return u.u64;
+}
+
 #if defined(__gfx950__)
 template <typename T, int absz, int cbid, int blgp>
 __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const _B16x8& inpA,
@@ -404,12 +413,29 @@ __device__ __forceinline__ _B16x8 convert_b8x8_fp4(
 
 // FP4 dequant + uniform scale: converts 8 packed FP4 nibbles and
 // multiplies each result by the same scalar.
-// Wraps convert + scale into a single call so the compiler can
-// optimize across both phases when fully unrolled.
+// Uses pk_f32_fp4 intrinsic to go FP4→float32 directly, avoiding
+// the BF16→float32 round-trip (saves 8 conversion instructions).
 template <typename T>
 __device__ __forceinline__ _B16x8 convert_and_scale_b8x8_fp4(
     const _B8x8 input, int byte_offset, float scale)
 {
+#if defined(__gfx950__)
+    union { uint2 u2; uint8_t bytes[8]; } tmp;
+    tmp.u2 = input;
+
+    _B16x8 ret;
+    T* vals = reinterpret_cast<T*>(&ret);
+    using f32x2_raw_t = float __attribute__((ext_vector_type(2)));
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        f32x2_raw_t f32_pair = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(
+            tmp.bytes[byte_offset + i], 1.0f, 0);
+        vals[2*i]     = from_float<T>(f32_pair[0] * scale);
+        vals[2*i + 1] = from_float<T>(f32_pair[1] * scale);
+    }
+    return ret;
+#else
     _B16x8 ret = convert_b8x8_fp4<T>(input, byte_offset);
     T* vals = reinterpret_cast<T*>(&ret);
     #pragma unroll
@@ -417,14 +443,33 @@ __device__ __forceinline__ _B16x8 convert_and_scale_b8x8_fp4(
         vals[e] = from_float<T>(to_float<T>(vals[e]) * scale);
     }
     return ret;
+#endif
 }
 
 // FP4 dequant + per-element scale: converts 8 packed FP4 nibbles and
 // multiplies each by its corresponding scale[0..7].
+// Uses pk_f32_fp4 to skip BF16→float32 round-trip.
 template <typename T>
 __device__ __forceinline__ _B16x8 convert_and_scale_b8x8_fp4_per_elem(
     const _B8x8 input, int byte_offset, const float scales[8])
 {
+#if defined(__gfx950__)
+    union { uint2 u2; uint8_t bytes[8]; } tmp;
+    tmp.u2 = input;
+
+    _B16x8 ret;
+    T* vals = reinterpret_cast<T*>(&ret);
+    using f32x2_raw_t = float __attribute__((ext_vector_type(2)));
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        f32x2_raw_t f32_pair = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(
+            tmp.bytes[byte_offset + i], 1.0f, 0);
+        vals[2*i]     = from_float<T>(f32_pair[0] * scales[2*i]);
+        vals[2*i + 1] = from_float<T>(f32_pair[1] * scales[2*i + 1]);
+    }
+    return ret;
+#else
     _B16x8 ret = convert_b8x8_fp4<T>(input, byte_offset);
     T* vals = reinterpret_cast<T*>(&ret);
     #pragma unroll
@@ -432,6 +477,7 @@ __device__ __forceinline__ _B16x8 convert_and_scale_b8x8_fp4_per_elem(
         vals[e] = from_float<T>(to_float<T>(vals[e]) * scales[e]);
     }
     return ret;
+#endif
 }
 
 // FP4 dequant with per-byte scales: each of the 4 bytes gets its own

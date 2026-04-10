@@ -497,9 +497,15 @@ _paged_attention_kernel(const int* block_table_seq,
                     const int offset2 = byte_offset % KX;
                     const cache_t* k_fetch_ptr = k_ptr3 + offset1 * KX + offset2;
 
-                    *reinterpret_cast<uint64_t*>(
-                        &Klocal[head_loop][token_depth][qkhe_depth]) =
-                        *reinterpret_cast<const uint64_t*>(k_fetch_ptr);
+                    if constexpr(NT_KV_LOAD) {
+                        *reinterpret_cast<uint64_t*>(
+                            &Klocal[head_loop][token_depth][qkhe_depth]) =
+                            load_ntmprl_8Byte(k_fetch_ptr);
+                    } else {
+                        *reinterpret_cast<uint64_t*>(
+                            &Klocal[head_loop][token_depth][qkhe_depth]) =
+                            *reinterpret_cast<const uint64_t*>(k_fetch_ptr);
+                    }
                 }
                 else
                 {
@@ -599,9 +605,15 @@ _paged_attention_kernel(const int* block_table_seq,
                         static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
                     const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
 
-                    *reinterpret_cast<uint64_t*>(
-                        &Vlocal[vtoken_depth][vhe_depth][vblock_depth]) =
-                        *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
+                    if constexpr(NT_KV_LOAD) {
+                        *reinterpret_cast<uint64_t*>(
+                            &Vlocal[vtoken_depth][vhe_depth][vblock_depth]) =
+                            load_ntmprl_8Byte(v_fetch_ptr);
+                    } else {
+                        *reinterpret_cast<uint64_t*>(
+                            &Vlocal[vtoken_depth][vhe_depth][vblock_depth]) =
+                            *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
+                    }
                 }
                 else
                 {
@@ -2660,7 +2672,11 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                         uint64_t u64;
                         _B16x8 b16x8;
                     } loaded_data;
-                    loaded_data.u64 = *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
+                    if constexpr(NT_KV_LOAD) {
+                        loaded_data.u64 = load_ntmprl_8Byte(v_fetch_ptr);
+                    } else {
+                        loaded_data.u64 = *reinterpret_cast<const uint64_t*>(v_fetch_ptr);
+                    }
                     _B8x16 temp;
                     temp.xy[0] = *reinterpret_cast<_B8x8*>(&loaded_data.u64);
                     temp.xy[1] = temp.xy[0];
