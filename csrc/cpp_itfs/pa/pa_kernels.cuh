@@ -570,7 +570,9 @@ _paged_attention_kernel(const int* block_table_seq,
     }
 
     _B16x8 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; // this can be interpreted as B8x16 too
-    __shared__ unsigned char vlds_ptr[TOKENS_PER_WARP * n_thread_per_block * 16];
+    constexpr int VLDS_PAD = (KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) ? 4 : 0;
+    constexpr int VLDS_ROW_STRIDE = n_thread_per_block * 16 + VLDS_PAD;
+    __shared__ unsigned char vlds_ptr[TOKENS_PER_WARP * VLDS_ROW_STRIDE];
     static_assert(VBLOCKS_PER_LANE == VTLANELOOP,
                   "make sure we can keep un-shuffled data in Vlocal as well");
 
@@ -1126,15 +1128,16 @@ _paged_attention_kernel(const int* block_table_seq,
                 const int vlocal_token_idx =
                     vblock_depth * k_thread_per_block + threadIdx.x / n_thread_per_block;
                 if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
-                    *reinterpret_cast<uint64_t*>(
-                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
-                                    vlds_col_idx) * 16) =
-                        *reinterpret_cast<const uint64_t*>(
-                            &Vlocal[vtoken_depth][vhe_depth][vblock_depth]);
+                    unsigned char* dest = vlds_ptr +
+                        vlocal_token_idx * VLDS_ROW_STRIDE + vlds_col_idx * 16;
+                    const uint64_t d64 = *reinterpret_cast<const uint64_t*>(
+                        &Vlocal[vtoken_depth][vhe_depth][vblock_depth]);
+                    *reinterpret_cast<uint32_t*>(dest)     = static_cast<uint32_t>(d64);
+                    *reinterpret_cast<uint32_t*>(dest + 4) = static_cast<uint32_t>(d64 >> 32);
                 } else {
                     *reinterpret_cast<_B16x8*>(
-                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
-                                    vlds_col_idx) * 16) =
+                        vlds_ptr + vlocal_token_idx * VLDS_ROW_STRIDE +
+                                   vlds_col_idx * 16) =
                         Vlocal[vtoken_depth][vhe_depth][vblock_depth];
                 }
             }
@@ -1155,9 +1158,8 @@ _paged_attention_kernel(const int* block_table_seq,
                 {
                     const int fp4_byte_idx   = vlds_elem_idx / 2;
                     const int fp4_shift      = (vlds_elem_idx & 1) * 4;
-                    const int lds_row_stride = n_thread_per_block * 16;
                     const cache_t* lds_base  = reinterpret_cast<const cache_t*>(
-                        vlds_ptr + vlocal_token_idx * lds_row_stride
+                        vlds_ptr + vlocal_token_idx * VLDS_ROW_STRIDE
                         + vlds_col_idx * 16);
 
                     union { _B16x8 b16x8; uint8_t bytes[16]; } pk;
@@ -1166,15 +1168,15 @@ _paged_attention_kernel(const int* block_table_seq,
                     #pragma unroll
                     for(int p = 0; p < 4; p++)
                     {
-                        uint8_t n0 = (lds_base[(2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
-                        uint8_t n1 = (lds_base[(2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n0 = (lds_base[(2*p)     * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(2*p + 1) * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
                         pk.bytes[p] = n0 | (n1 << 4);
                     }
                     #pragma unroll
                     for(int p = 0; p < 4; p++)
                     {
-                        uint8_t n0 = (lds_base[(8 + 2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
-                        uint8_t n1 = (lds_base[(8 + 2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n0 = (lds_base[(8 + 2*p)     * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(8 + 2*p + 1) * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
                         pk.bytes[12 + p] = n0 | (n1 << 4);
                     }
 
@@ -1188,9 +1190,8 @@ _paged_attention_kernel(const int* block_table_seq,
                         const cache_t* fetched_elems =
                             reinterpret_cast<const cache_t*>(
                                 vlds_ptr +
-                                (/*row=*/(vlocal_token_idx + d2) *
-                                     n_thread_per_block +
-                                 /*col=*/vlds_col_idx) * 16);
+                                (vlocal_token_idx + d2) * VLDS_ROW_STRIDE +
+                                vlds_col_idx * 16);
                         elems[d2] = fetched_elems[vlds_elem_idx];
                     }
                     Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
@@ -2626,7 +2627,9 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     }
 
     _B16x8 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; // this can be interpreted as B8x16 too
-    __shared__ unsigned char vlds_ptr[TOKENS_PER_WARP * n_thread_per_block * 16];
+    constexpr int VLDS_PAD = (KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) ? 4 : 0;
+    constexpr int VLDS_ROW_STRIDE = n_thread_per_block * 16 + VLDS_PAD;
+    __shared__ unsigned char vlds_ptr[TOKENS_PER_WARP * VLDS_ROW_STRIDE];
     static_assert(VBLOCKS_PER_LANE == VTLANELOOP,
                   "make sure we can keep un-shuffled data in Vlocal as well");
 
@@ -2705,15 +2708,16 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 const int vlocal_token_idx =
                     vblock_depth * k_thread_per_block + threadIdx.x / n_thread_per_block;
                 if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
-                    *reinterpret_cast<uint64_t*>(
-                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
-                                    vlds_col_idx) * 16) =
-                        *reinterpret_cast<const uint64_t*>(
-                            &Vlocal[vtoken_depth][vhe_depth][vblock_depth]);
+                    unsigned char* dest = vlds_ptr +
+                        vlocal_token_idx * VLDS_ROW_STRIDE + vlds_col_idx * 16;
+                    const uint64_t d64 = *reinterpret_cast<const uint64_t*>(
+                        &Vlocal[vtoken_depth][vhe_depth][vblock_depth]);
+                    *reinterpret_cast<uint32_t*>(dest)     = static_cast<uint32_t>(d64);
+                    *reinterpret_cast<uint32_t*>(dest + 4) = static_cast<uint32_t>(d64 >> 32);
                 } else {
                     *reinterpret_cast<_B16x8*>(
-                        vlds_ptr + (vlocal_token_idx * n_thread_per_block +
-                                    vlds_col_idx) * 16) =
+                        vlds_ptr + vlocal_token_idx * VLDS_ROW_STRIDE +
+                                   vlds_col_idx * 16) =
                         Vlocal[vtoken_depth][vhe_depth][vblock_depth];
                 }
             }
@@ -2734,9 +2738,8 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 {
                     const int fp4_byte_idx   = vlds_elem_idx / 2;
                     const int fp4_shift      = (vlds_elem_idx & 1) * 4;
-                    const int lds_row_stride = n_thread_per_block * 16;
                     const cache_t* lds_base  = reinterpret_cast<const cache_t*>(
-                        vlds_ptr + vlocal_token_idx * lds_row_stride
+                        vlds_ptr + vlocal_token_idx * VLDS_ROW_STRIDE
                         + vlds_col_idx * 16);
 
                     union { _B16x8 b16x8; uint8_t bytes[16]; } pk;
@@ -2745,15 +2748,15 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                     #pragma unroll
                     for(int p = 0; p < 4; p++)
                     {
-                        uint8_t n0 = (lds_base[(2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
-                        uint8_t n1 = (lds_base[(2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n0 = (lds_base[(2*p)     * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(2*p + 1) * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
                         pk.bytes[p] = n0 | (n1 << 4);
                     }
                     #pragma unroll
                     for(int p = 0; p < 4; p++)
                     {
-                        uint8_t n0 = (lds_base[(8 + 2*p)     * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
-                        uint8_t n1 = (lds_base[(8 + 2*p + 1) * lds_row_stride + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n0 = (lds_base[(8 + 2*p)     * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
+                        uint8_t n1 = (lds_base[(8 + 2*p + 1) * VLDS_ROW_STRIDE + fp4_byte_idx] >> fp4_shift) & 0xF;
                         pk.bytes[12 + p] = n0 | (n1 << 4);
                     }
 
@@ -2767,9 +2770,8 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                         const cache_t* fetched_elems =
                             reinterpret_cast<const cache_t*>(
                                 vlds_ptr +
-                                (/*row=*/(vlocal_token_idx + d2) *
-                                     n_thread_per_block +
-                                 /*col=*/vlds_col_idx) * 16);
+                                (vlocal_token_idx + d2) * VLDS_ROW_STRIDE +
+                                vlds_col_idx * 16);
                         elems[d2] = fetched_elems[vlds_elem_idx];
                     }
                     Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
