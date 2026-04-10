@@ -819,44 +819,18 @@ _paged_attention_kernel(const int* block_table_seq,
                     d_out[gqa_ratio_loop][mtp][token_depth][i] = variant->QueryTransform(
                         variant_params, d_out[gqa_ratio_loop][mtp][token_depth][i]);
                 }
-            }
-        }
-    }
-
-
-    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
-    {
-        // For FP4 multi-block mode, k_token_scales are always 1.0 (scales
-        // are applied per-block inside the MFMA loop).  Skip the
-        // redundant multiply.
-        if (fp4_abs_k_blocks <= 1) {
-            for(int token_depth = 0; token_depth < TLOOP; token_depth++)
-            {
-                for(int mtp = 0; mtp < mtp_loop; mtp++)
+                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+                    if (fp4_abs_k_blocks <= 1)
                     {
                         for(int i = 0; i < 4; i++)
-                        {
                             d_out[gqa_ratio_loop][mtp][token_depth][i] *= k_token_scales[token_depth];
-                        }
                     }
                 }
-            }
-        }
-    }
-    else if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
-    {
-        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
-        {
-            for(int mtp = 0; mtp < mtp_loop; mtp++)
-            {
-                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+                else if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
                     for(int i = 0; i < 4; i++)
-                    {
                         d_out[gqa_ratio_loop][mtp][token_depth][i] *= k_token_scales[token_depth];
-                    }
                 }
             }
         }
@@ -1046,15 +1020,14 @@ _paged_attention_kernel(const int* block_table_seq,
             {
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
-                    d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
-                    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                     {
-                        // For FP4 multi-block mode, v_token_scales are
-                        // always 1.0 (per-block V scales are applied in
-                        // the V MFMA loop).  Skip the redundant multiply.
-                        if (fp4_abs_v_blocks <= 1) {
-                            d_out[gqa_ratio_loop][mtp][token_depth] *= v_token_scales[token_depth];
+                        float combined_norm = inv_sum_scale[gqa_ratio_loop][mtp];
+                        if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+                        {
+                            if (fp4_abs_v_blocks <= 1)
+                                combined_norm *= v_token_scales[token_depth];
                         }
+                        d_out[gqa_ratio_loop][mtp][token_depth] *= combined_norm;
                     }
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
@@ -1129,11 +1102,20 @@ _paged_attention_kernel(const int* block_table_seq,
     constexpr int ELEMS8_ELEMS4_RATIO  = 8 / 4;
     constexpr int ELEMS16_ELEMS8_RATIO = 16 / 8;
 
+    _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
+
+    // Fused V LDS Transpose + V MFMA: transpose V data via LDS and immediately
+    // execute MFMA, eliminating extra barriers and improving data locality.
     for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
     {
+        floatx4 fused_tmp_out[MTP_PER_THREAD][GQA_RATIO_LOOP];
+        for(int m = 0; m < mtp_loop; m++)
+            for(int g = 0; g < GQA_RATIO_LOOP; g++)
+                fused_tmp_out[m][g] = {0};
+
         for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
         {
-            // 1. store data into LDS
+            // 1. Store V data to LDS
             for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
             {
                 const int vlds_col_idx = laneid % n_thread_per_block;
@@ -1155,14 +1137,13 @@ _paged_attention_kernel(const int* block_table_seq,
             }
             __syncthreads();
 
-            // 2. load data from LDS (transposed), then do multification
+            // 2. Read transposed V data from LDS into local registers
+            _B16x8 Vtransposed[VTLANELOOP];
             for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
             {
                 const int vlocal_head_elem = warpid * 16 + lane16id;
-
                 const int vlds_col_idx  = vlocal_head_elem / CONTIGUOUS_KV_ELEMS_16B_LOAD;
                 const int vlds_elem_idx = vlocal_head_elem % CONTIGUOUS_KV_ELEMS_16B_LOAD;
-
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
@@ -1192,7 +1173,7 @@ _paged_attention_kernel(const int* block_table_seq,
                         pk.bytes[12 + p] = n0 | (n1 << 4);
                     }
 
-                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = pk.b16x8;
+                    Vtransposed[vfetch_depth] = pk.b16x8;
                 }
                 else
                 {
@@ -1206,27 +1187,16 @@ _paged_attention_kernel(const int* block_table_seq,
                                 vlds_col_idx * 16);
                         elems[d2] = fetched_elems[vlds_elem_idx];
                     }
-                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                    Vtransposed[vfetch_depth] =
                         *reinterpret_cast<const _B16x8*>(elems);
                 }
             }
             __syncthreads();
-        }
-    }
 
-    _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
-
-    // Softmax V mfma
-    // v layout: 16he across lanes x 16 tokens per lane
-    for(int mtp = 0; mtp < mtp_loop; mtp++)
-    {
-        for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
-        {
-            for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
+            // 3. V MFMA using transposed data for all (mtp, gqa) combinations
+            for(int mtp = 0; mtp < mtp_loop; mtp++)
             {
-                floatx4 tmp_out = {0};
-
-                for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
+                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
                     if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
                     {
@@ -1243,8 +1213,10 @@ _paged_attention_kernel(const int* block_table_seq,
                                 tmp_in.xy[i] = shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
                                                             [offset2][lane16id][offset1];
                             }
-                            tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                                Vlocal[vtoken_depth][vhe_depth][vfetch_depth], tmp_in, tmp_out);
+                            fused_tmp_out[mtp][gqa_ratio_loop] =
+                                gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                    Vtransposed[vfetch_depth], tmp_in,
+                                    fused_tmp_out[mtp][gqa_ratio_loop]);
 #else
                             for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                             {
@@ -1252,13 +1224,12 @@ _paged_attention_kernel(const int* block_table_seq,
                                                    vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
                                 const int offset1 = offset % ROWS_PER_WARP;
                                 const int offset2 = offset / ROWS_PER_WARP;
-                                // output format is 16 qheads across 16 lanes, 16 head elems spread
-                                // across 4 rows
-                                tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i],
-                                    shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
-                                                 [lane16id][offset1],
-                                    tmp_out);
+                                fused_tmp_out[mtp][gqa_ratio_loop] =
+                                    gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                        Vtransposed[vfetch_depth].xy[i],
+                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                     [offset2][lane16id][offset1],
+                                        fused_tmp_out[mtp][gqa_ratio_loop]);
                             }
 #endif
                         }
@@ -1267,7 +1238,6 @@ _paged_attention_kernel(const int* block_table_seq,
                     {
                         constexpr int EFFECTIVE_VTLANELOOP = VTLANELOOP * ELEMS16_ELEMS8_RATIO;
 
-                        // Hoist invariants that only depend on vhe_depth/warpid
                         const int v_blk = (fp4_abs_v_blocks > 1)
                             ? static_cast<int>((vhe_depth * NWARPS * 16 + warpid * 16)
                               / fp4_v_block_size)
@@ -1279,10 +1249,9 @@ _paged_attention_kernel(const int* block_table_seq,
 
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
-                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
+                            _B16x8 Vtmp = Vtransposed[vfetch_depth];
                             _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
 
-                            // Hoist vlocal_tok outside j loop
                             const int vlocal_tok =
                                 rowid * VTOKENS_PER_LANE
                                 + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
@@ -1389,8 +1358,10 @@ _paged_attention_kernel(const int* block_table_seq,
                                                                 [vtoken_depth][offset2][lane16id]
                                                                 [offset1];
                                 }
-                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                                    Vlocaltmp, tmp_in, tmp_out);
+                                fused_tmp_out[mtp][gqa_ratio_loop] =
+                                    gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                        Vlocaltmp, tmp_in,
+                                        fused_tmp_out[mtp][gqa_ratio_loop]);
 #else
                                 for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                                 {
@@ -1399,11 +1370,12 @@ _paged_attention_kernel(const int* block_table_seq,
                                         combined_vfetch * ELEMS8_ELEMS4_RATIO + i;
                                     const int offset1 = offset % ROWS_PER_WARP;
                                     const int offset2 = offset / ROWS_PER_WARP;
-                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                                        Vlocaltmp.xy[i],
-                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
-                                                     [offset2][lane16id][offset1],
-                                        tmp_out);
+                                    fused_tmp_out[mtp][gqa_ratio_loop] =
+                                        gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                            Vlocaltmp.xy[i],
+                                            shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                         [offset2][lane16id][offset1],
+                                            fused_tmp_out[mtp][gqa_ratio_loop]);
                                 }
 #endif
                             }
@@ -1413,8 +1385,7 @@ _paged_attention_kernel(const int* block_table_seq,
                     {
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
-                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
-                            // reinterpret V format as 16 elements of 8bits
+                            _B16x8 Vtmp = Vtransposed[vfetch_depth];
                             _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
@@ -1426,29 +1397,33 @@ _paged_attention_kernel(const int* block_table_seq,
                                         j * ELEMS8_ELEMS4_RATIO + i;
                                     const int offset1 = (offset % ROWS_PER_WARP) / 2;
                                     const int offset2 = offset / ROWS_PER_WARP;
-                                    // output format is 16 qheads across 16 lanes, 16 head elems
-                                    // spread across 4 rows
-                                    tmp_out = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
-                                        reinterpret_cast<_T8x8*>(&Vtmp8x8)->i64,
-                                        reinterpret_cast<_T8x8*>(
-                                            &shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
-                                                          [offset2][lane16id][offset1])
-                                            ->i64,
-                                        tmp_out);
+                                    fused_tmp_out[mtp][gqa_ratio_loop] =
+                                        gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
+                                            reinterpret_cast<_T8x8*>(&Vtmp8x8)->i64,
+                                            reinterpret_cast<_T8x8*>(
+                                                &shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                              [offset2][lane16id][offset1])
+                                                ->i64,
+                                            fused_tmp_out[mtp][gqa_ratio_loop]);
                                 }
                             }
                         }
                     }
-                    __syncthreads();
                 }
-                // apply post Softmax V mfma v_scale (scalar, for FP8 only;
-                // FP4 per-token V scale is pre-applied to softmax weights)
+            }
+        }
+
+        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        {
+            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+            {
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto &&
                              KV_DTYPE != vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    tmp_out *= *v_scale_ptr;
+                    fused_tmp_out[mtp][gqa_ratio_loop] *= *v_scale_ptr;
                 }
-                outelems[gqa_ratio_loop][mtp][vhe_depth] = from_floatx4<scalar_t>(tmp_out);
+                outelems[gqa_ratio_loop][mtp][vhe_depth] =
+                    from_floatx4<scalar_t>(fused_tmp_out[mtp][gqa_ratio_loop]);
             }
         }
     }
@@ -2713,11 +2688,19 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     constexpr int ELEMS8_ELEMS4_RATIO  = 8 / 4;
     constexpr int ELEMS16_ELEMS8_RATIO = 16 / 8;
 
+    _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
+
+    // Fused V LDS Transpose + V MFMA (MTP path)
     for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
     {
+        floatx4 fused_tmp_out[MTP_PER_THREAD][GQA_RATIO_LOOP];
+        for(int m = 0; m < mtp_loop; m++)
+            for(int g = 0; g < GQA_RATIO_LOOP; g++)
+                fused_tmp_out[m][g] = {0};
+
         for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
         {
-            // 1. store data into LDS
+            // 1. Store V data to LDS
             for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
             {
                 const int vlds_col_idx = laneid % n_thread_per_block;
@@ -2739,14 +2722,13 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
             }
             __syncthreads();
 
-            // 2. load data from LDS (transposed), then do multification
+            // 2. Read transposed V data from LDS
+            _B16x8 Vtransposed[VTLANELOOP];
             for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
             {
                 const int vlocal_head_elem = warpid * 16 + lane16id;
-
                 const int vlds_col_idx  = vlocal_head_elem / CONTIGUOUS_KV_ELEMS_16B_LOAD;
                 const int vlds_elem_idx = vlocal_head_elem % CONTIGUOUS_KV_ELEMS_16B_LOAD;
-
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
@@ -2776,7 +2758,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                         pk.bytes[12 + p] = n0 | (n1 << 4);
                     }
 
-                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = pk.b16x8;
+                    Vtransposed[vfetch_depth] = pk.b16x8;
                 }
                 else
                 {
@@ -2790,27 +2772,16 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                 vlds_col_idx * 16);
                         elems[d2] = fetched_elems[vlds_elem_idx];
                     }
-                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                    Vtransposed[vfetch_depth] =
                         *reinterpret_cast<const _B16x8*>(elems);
                 }
             }
             __syncthreads();
-        }
-    }
 
-    _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
-
-    // Softmax V mfma
-    // v layout: 16he across lanes x 16 tokens per lane
-    for(int mtp = 0; mtp < mtp_loop; mtp++)
-    {
-        for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
-        {
-            for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
+            // 3. V MFMA using transposed data
+            for(int mtp = 0; mtp < mtp_loop; mtp++)
             {
-                floatx4 tmp_out = {0};
-
-                for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
+                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
                     if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
                     {
@@ -2827,8 +2798,10 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                 tmp_in.xy[i] = shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
                                                             [offset2][lane16id][offset1];
                             }
-                            tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                                Vlocal[vtoken_depth][vhe_depth][vfetch_depth], tmp_in, tmp_out);
+                            fused_tmp_out[mtp][gqa_ratio_loop] =
+                                gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                    Vtransposed[vfetch_depth], tmp_in,
+                                    fused_tmp_out[mtp][gqa_ratio_loop]);
 #else
                             for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                             {
@@ -2836,26 +2809,21 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                                    vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
                                 const int offset1 = offset % ROWS_PER_WARP;
                                 const int offset2 = offset / ROWS_PER_WARP;
-                                // output format is 16 qheads across 16 lanes, 16 head elems spread
-                                // across 4 rows
-                                tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i],
-                                    shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
-                                                 [lane16id][offset1],
-                                    tmp_out);
+                                fused_tmp_out[mtp][gqa_ratio_loop] =
+                                    gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                        Vtransposed[vfetch_depth].xy[i],
+                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                     [offset2][lane16id][offset1],
+                                        fused_tmp_out[mtp][gqa_ratio_loop]);
                             }
 #endif
                         }
                     }
                     else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
                     {
-                        // FP4 V MFMA: convert packed FP4 to BF16, then use BF16 MFMA.
-                        // NOTE: V block scale application is handled in the main
-                        // _paged_attention_kernel; this experimental path only does
-                        // basic dequantization (no per-block-32 scale correction).
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
-                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
+                            _B16x8 Vtmp = Vtransposed[vfetch_depth];
                             _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
@@ -2877,19 +2845,22 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                         shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
                                                      [lane16id][offset1];
                                 }
-                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                                    Vlocaltmp, tmp_in, tmp_out);
+                                fused_tmp_out[mtp][gqa_ratio_loop] =
+                                    gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                        Vlocaltmp, tmp_in,
+                                        fused_tmp_out[mtp][gqa_ratio_loop]);
 #else
                                 for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                                 {
                                     const int offset_i = offset + i;
                                     const int offset1 = offset_i % ROWS_PER_WARP;
                                     const int offset2 = offset_i / ROWS_PER_WARP;
-                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                                        Vlocaltmp.xy[i],
-                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
-                                                     [lane16id][offset1],
-                                        tmp_out);
+                                    fused_tmp_out[mtp][gqa_ratio_loop] =
+                                        gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                            Vlocaltmp.xy[i],
+                                            shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                         [offset2][lane16id][offset1],
+                                            fused_tmp_out[mtp][gqa_ratio_loop]);
                                 }
 #endif
                             }
@@ -2899,8 +2870,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                     {
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
-                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
-                            // reinterpret V format as 16 elements of 8bits
+                            _B16x8 Vtmp = Vtransposed[vfetch_depth];
                             _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
@@ -2920,8 +2890,10 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                         shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
                                                      [lane16id][offset1];
                                 }
-                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                                    Vlocaltmp, tmp_in, tmp_out);
+                                fused_tmp_out[mtp][gqa_ratio_loop] =
+                                    gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                        Vlocaltmp, tmp_in,
+                                        fused_tmp_out[mtp][gqa_ratio_loop]);
 #else
                                 for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                                 {
@@ -2930,28 +2902,34 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                         j * ELEMS8_ELEMS4_RATIO + i;
                                     const int offset1 = offset % ROWS_PER_WARP;
                                     const int offset2 = offset / ROWS_PER_WARP;
-                                    // output format is 16 qheads across 16 lanes, 16 head elems
-                                    // spread across 4 rows
-                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                                        Vlocaltmp.xy[i],
-                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
-                                                     [lane16id][offset1],
-                                        tmp_out);
+                                    fused_tmp_out[mtp][gqa_ratio_loop] =
+                                        gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
+                                            reinterpret_cast<_T8x8*>(&Vtmp8x8)->i64,
+                                            reinterpret_cast<_T8x8*>(
+                                                &shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                              [offset2][lane16id][offset1])
+                                                ->i64,
+                                            fused_tmp_out[mtp][gqa_ratio_loop]);
                                 }
 #endif
                             }
                         }
                     }
-                    __syncthreads();
                 }
-                // apply post Softmax V mfma v_scale (scalar, for FP8 only;
-                // FP4 per-token V scale is pre-applied to softmax weights)
+            }
+        }
+
+        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        {
+            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+            {
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto &&
                              KV_DTYPE != vllm::Fp8KVCacheDataType::kFp4E2M1)
                 {
-                    tmp_out *= *v_scale_ptr;
+                    fused_tmp_out[mtp][gqa_ratio_loop] *= *v_scale_ptr;
                 }
-                outelems[gqa_ratio_loop][mtp][vhe_depth] = from_floatx4<scalar_t>(tmp_out);
+                outelems[gqa_ratio_loop][mtp][vhe_depth] =
+                    from_floatx4<scalar_t>(fused_tmp_out[mtp][gqa_ratio_loop]);
             }
         }
     }
